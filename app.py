@@ -1,5 +1,6 @@
 from flask import Flask, jsonify, request
 import google.generativeai as genai
+from google.api_core import exceptions as google_api_exceptions
 from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, InvalidVideoId
 from youtube_transcript_api._errors import IpBlocked, TranscriptsDisabled
 from flask_cors import CORS
@@ -7,15 +8,40 @@ import os
 import re
 from dotenv import load_dotenv
 from urllib.parse import urlparse, parse_qs
+from pathlib import Path
 import time
 import requests
 
-load_dotenv()
+try:
+    import grpc
+except ImportError:
+    grpc = None
+
+_BASE_DIR = Path(__file__).resolve().parent
+# override=True: .env wins over a stale GEMINI_API_KEY from Windows system env (common "it worked then broke" cause)
+load_dotenv(_BASE_DIR / ".env", override=True)
+
+
+def _reload_env_from_file() -> None:
+    """Re-read .env so key/model changes apply without restarting Flask."""
+    load_dotenv(_BASE_DIR / ".env", override=True)
+
+
+def _read_gemini_api_key() -> str:
+    """Read key from env; strip BOM, quotes, and whitespace (common .env mistakes)."""
+    raw = os.getenv("GEMINI_API_KEY") or ""
+    return raw.strip().strip("\ufeff").strip('"').strip("'")
+
 
 app = Flask(__name__)
 CORS(app)
 
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+genai.configure(api_key=_read_gemini_api_key() or None)
+_k0 = _read_gemini_api_key()
+if _k0:
+    print(f"[env] GEMINI_API_KEY loaded from .env (len={len(_k0)}, prefix={_k0[:4]}…)")
+else:
+    print("[env] WARNING: GEMINI_API_KEY is empty after loading .env")
 
 # Simple cache for summaries: {video_id: {"summary": ..., "language": ..., timestamp: ...}}
 summary_cache = {}
@@ -24,6 +50,42 @@ CACHE_DURATION = 86400  # Cache for 24 hours to avoid YouTube rate limiting
 # Request throttling - track last request time
 last_request_time = {}
 MIN_REQUEST_INTERVAL = 5  # Minimum 5 seconds between requests for same video
+
+
+def _looks_like_invalid_gemini_key(error_msg: str) -> bool:
+    m = error_msg.lower()
+    return any(
+        phrase in m
+        for phrase in (
+            "api_key_invalid",
+            "api key not found",
+            "pass a valid api key",
+            "invalid api key",
+        )
+    )
+
+
+def _looks_like_gemini_rate_limit(error_msg: str) -> bool:
+    """Match HTTP handler to Gemini exhaustion messages (not only literal '429')."""
+    m = error_msg.lower()
+    return any(
+        phrase in m
+        for phrase in (
+            "429",
+            "quota",
+            "rate limit",
+            "rate_limit",
+            "rate-limited",
+            "resource exhausted",
+            "resource_exhausted",
+            "hit rate limits",
+            "still rate",
+            "all api key",
+            "unique key",
+            "try again in a few moments",
+        )
+    )
+
 
 @app.route('/', methods=['GET'])
 def home():
@@ -40,25 +102,44 @@ def home():
 def health_check():
     return jsonify({"status": "active", "message": "Service is running"}), 200
 
+
+@app.after_request
+def _no_cache_summary_responses(response):
+    """Prevent browsers/CDNs from caching GET /summary (was returning video 1's body for other videos)."""
+    if request.path == "/summary":
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, private, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
+
 def extract_video_id(youtube_url):
-    """Extract video ID from YouTube URL"""
-    # Handle youtu.be short URLs
-    if 'youtu.be/' in youtube_url:
-        match = re.search(r'youtu\.be/([a-zA-Z0-9_-]{11})', youtube_url)
-        if match:
-            return match.group(1)
-    
-    # Handle youtube.com URLs
-    if 'youtube.com' in youtube_url:
-        parsed = urlparse(youtube_url)
-        video_id = parse_qs(parsed.query).get('v', [None])[0]
-        if video_id and len(video_id) == 11:
-            return video_id
-    
-    # Check if it's already a video ID
-    if re.match(r'^[a-zA-Z0-9_-]{11}$', youtube_url):
-        return youtube_url
-    
+    """Extract 11-character video ID from a YouTube URL or raw ID."""
+    if not youtube_url:
+        return None
+    s = youtube_url.strip()
+
+    if re.match(r"^[a-zA-Z0-9_-]{11}$", s):
+        return s
+
+    m = re.search(r"(?:youtu\.be/|youtube\.com/embed/)([a-zA-Z0-9_-]{11})", s)
+    if m:
+        return m.group(1)
+
+    m = re.search(r"youtube\.com/(?:shorts|embed|live)/([a-zA-Z0-9_-]{11})", s)
+    if m:
+        return m.group(1)
+
+    m = re.search(r"youtube\.com/v/([a-zA-Z0-9_-]{11})(?:\?|$|/)", s)
+    if m:
+        return m.group(1)
+
+    if "youtube.com" in s or "youtube-nocookie.com" in s or "music.youtube.com" in s:
+        parsed = urlparse(s)
+        for vid in parse_qs(parsed.query).get("v", []):
+            if vid and len(vid) == 11:
+                return vid
+
     return None
 
 @app.route('/summary', methods=['GET'])
@@ -82,7 +163,7 @@ def youtube_summarizer():
 9. Concluding remarks summarize the main takeaways effectively
 10. The video ends with a call-to-action or invitation for further engagement""",
             "error": False,
-            "language": "🇬🇧 English",
+            "language": "English",
             "available_languages": ["en", "es", "fr"],
             "demo": True
         }), 200
@@ -102,6 +183,8 @@ def youtube_summarizer():
             "data": "Invalid YouTube URL or Video ID. Please provide a valid YouTube link or video ID (11 characters)",
             "error": True
         }), 400
+
+    print(f"[summary] video_id={video_id}")
     
     # Check cache first (only for successful results)
     if video_id in summary_cache:
@@ -111,6 +194,7 @@ def youtube_summarizer():
             return jsonify({
                 "data": cached_data['summary'],
                 "error": False,
+                "video_id": video_id,
                 "language": cached_data['language'],
                 "available_languages": cached_data.get('available_languages', []),
                 "cached": True
@@ -156,7 +240,17 @@ def youtube_summarizer():
             return jsonify({"data": "This video does not have subtitles available.", "error": True}), 404
         elif "No transcripts available" in error_msg:
             return jsonify({"data": "No Subtitles found. Try videos with English or Hindi subtitles.", "error": True}), 404
-        elif "429" in error_msg or "quota" in error_msg.lower():
+        elif _looks_like_invalid_gemini_key(error_msg):
+            return jsonify({
+                "data": (
+                    "Gemini rejected your API key (invalid or revoked). "
+                    "Create a new key at https://aistudio.google.com/apikey , put it in .env as GEMINI_API_KEY=..., "
+                    "save the file, and restart the Flask server."
+                ),
+                "error": True,
+                "error_type": "invalid_api_key",
+            }), 401
+        elif _looks_like_gemini_rate_limit(error_msg):
             return jsonify({
                 "data": "API Rate limit exceeded. Please try again in a few moments.",
                 "error": True,
@@ -166,177 +260,284 @@ def youtube_summarizer():
         return jsonify({"data": f"Unable to Summarize the video: {error_msg}", "error": True}), 500
 
     return jsonify({
-        "data": summary, 
+        "data": summary,
         "error": False,
+        "video_id": video_id,
         "language": transcript_data.get('language', 'Unknown'),
         "available_languages": transcript_data.get('available_languages', []),
         "cached": False
     }), 200
 
 
-def get_transcript(video_id):
-    """Fetch transcript using Webshare proxy to avoid YouTube IP blocking"""
-    
-    # Build proxy URL from environment variables
-    proxy_host = os.getenv("WEBSHARE_PROXY_HOST")
-    proxy_port = os.getenv("WEBSHARE_PROXY_PORT")
-    proxy_username = os.getenv("WEBSHARE_PROXY_USERNAME")
-    proxy_password = os.getenv("WEBSHARE_PROXY_PASSWORD")
-    
-    # Construct proxy URL: http://username:password@host:port
-    proxy_url = f"http://{proxy_username}:{proxy_password}@{proxy_host}:{proxy_port}"
-    proxies = {
-        'http': proxy_url,
-        'https': proxy_url,
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+
+def _direct_http_session():
+    s = requests.Session()
+    s.headers.update({"User-Agent": UA})
+    return s
+
+
+def _proxy_http_session():
+    """Return a requests Session using Webshare, or None if env is incomplete."""
+    host = os.getenv("WEBSHARE_PROXY_HOST")
+    port = os.getenv("WEBSHARE_PROXY_PORT")
+    user = os.getenv("WEBSHARE_PROXY_USERNAME")
+    password = os.getenv("WEBSHARE_PROXY_PASSWORD")
+    if not all([host, port, user, password]):
+        return None
+    proxy_url = f"http://{user}:{password}@{host}:{port}"
+    s = requests.Session()
+    s.proxies.update({"http": proxy_url, "https": proxy_url})
+    s.headers.update({"User-Agent": UA})
+    return s
+
+
+def _fetch_transcript_with_session(video_id, session):
+    """Core transcript fetch; raises library errors or Exception for no transcript text."""
+    yt_api = YouTubeTranscriptApi(http_client=session)
+    transcript_list = yt_api.list(video_id)
+
+    available_langs = set()
+    available_langs.update(transcript_list._generated_transcripts.keys())
+    available_langs.update(transcript_list._manually_created_transcripts.keys())
+    available_langs = list(available_langs)
+
+    print(f"Available languages: {available_langs}")
+
+    language_used = None
+    transcript_response = None
+
+    if any(lang.startswith("en") for lang in available_langs):
+        try:
+            transcript_response = yt_api.fetch(video_id, languages=["en"])
+            language_used = "English"
+            print("[ok] Using English transcript")
+        except Exception as e:
+            print(f"Failed to fetch English: {e}")
+
+    if transcript_response is None and any(lang.startswith("hi") for lang in available_langs):
+        try:
+            transcript_response = yt_api.fetch(video_id, languages=["hi"])
+            language_used = "Hindi"
+            print("[ok] Using Hindi transcript")
+        except Exception as e:
+            print(f"Failed to fetch Hindi: {e}")
+
+    if transcript_response is None and available_langs:
+        try:
+            first_lang = available_langs[0]
+            transcript_response = yt_api.fetch(video_id, languages=[first_lang])
+            language_used = f"Language: {first_lang}"
+            print(f"[ok] Using {first_lang} transcript")
+        except Exception as e:
+            print(f"Failed to fetch {first_lang}: {e}")
+
+    if transcript_response is None:
+        raise Exception(f"No transcripts available. Available languages: {available_langs}")
+
+    transcript_text = " ".join([snippet.text for snippet in transcript_response])
+    print(f"[ok] Successfully fetched transcript with {len(transcript_text)} characters")
+
+    return {
+        "text": transcript_text,
+        "language": language_used,
+        "available_languages": available_langs,
     }
-    
-    max_retries = 2
-    base_delay = 1
-    
+
+
+def _get_transcript_one_route(video_id, label, session, max_retries=2, base_delay=1):
+    """Try transcript fetch with retries on transient failures (e.g. IpBlocked)."""
+    last_error = None
     for attempt in range(max_retries):
         try:
-            print(f"Attempt {attempt + 1}/{max_retries} - Using Webshare proxy {proxy_host}:{proxy_port}")
-            
-            # Create requests session with proxy configuration
-            session = requests.Session()
-            session.proxies.update(proxies)
-            session.headers.update({
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            })
-            
-            # Create YouTubeTranscriptApi instance and pass session with proxy
-            yt_api = YouTubeTranscriptApi(http_client=session)
-            
-            # List all available transcripts
-            transcript_list = yt_api.list(video_id)
-            
-            # Get all available language codes
-            available_langs = set()
-            available_langs.update(transcript_list._generated_transcripts.keys())
-            available_langs.update(transcript_list._manually_created_transcripts.keys())
-            available_langs = list(available_langs)
-            
-            print(f"Available languages: {available_langs}")
-            
-            # Try English first
-            language_used = None
-            transcript_response = None
-            
-            # Check for English (en)
-            if any(lang.startswith('en') for lang in available_langs):
-                try:
-                    transcript_response = yt_api.fetch(video_id, languages=['en'])
-                    language_used = '🇬🇧 English'
-                    print(f"✅ Using English transcript")
-                except Exception as e:
-                    print(f"Failed to fetch English: {e}")
-            
-            # Try Hindi (hi) if English not available
-            if transcript_response is None and any(lang.startswith('hi') for lang in available_langs):
-                try:
-                    transcript_response = yt_api.fetch(video_id, languages=['hi'])
-                    language_used = '🇮🇳 Hindi'
-                    print(f"✅ Using Hindi transcript")
-                except Exception as e:
-                    print(f"Failed to fetch Hindi: {e}")
-            
-            # Try any available language as fallback
-            if transcript_response is None and available_langs:
-                try:
-                    first_lang = available_langs[0]
-                    transcript_response = yt_api.fetch(video_id, languages=[first_lang])
-                    language_used = f'Language: {first_lang}'
-                    print(f"✅ Using {first_lang} transcript")
-                except Exception as e:
-                    print(f"Failed to fetch {first_lang}: {e}")
-            
-            if transcript_response is None:
-                raise Exception(f"No transcripts available. Available languages: {available_langs}")
-            
-            # Extract text from FetchedTranscriptSnippet objects
-            transcript_text = ' '.join([snippet.text for snippet in transcript_response])
-            
-            print(f"✅ Successfully fetched transcript with {len(transcript_text)} characters")
-            
-            # Success! Return the transcript
-            return {
-                'text': transcript_text,
-                'language': language_used,
-                'available_languages': available_langs
-            }
-            
-        except InvalidVideoId as e:
-            print(f"Invalid video ID: {e}")
-            raise e
-        except IpBlocked as e:
-            print(f"Attempt {attempt + 1}/{max_retries} - IP/Proxy Blocked by YouTube: {e}")
-            if attempt < max_retries - 1:
-                delay = base_delay * (2 ** attempt)
-                print(f"Retrying in {delay} seconds...")
-                time.sleep(delay)
-            else:
-                raise Exception("Proxy is blocked. YouTube is blocking requests. Please wait 15-30 minutes and try again.")
+            print(f"[{label}] attempt {attempt + 1}/{max_retries}")
+            return _fetch_transcript_with_session(video_id, session)
+        except InvalidVideoId:
+            raise
         except TranscriptsDisabled as e:
             print(f"Transcripts disabled: {e}")
-            raise Exception("This video does not have transcripts available.")
-        except Exception as e:
-            print(f"Attempt {attempt + 1}/{max_retries} - Transcript fetch failed: {e}")
+            raise Exception("This video does not have transcripts available.") from e
+        except IpBlocked as e:
+            last_error = e
+            print(f"[{label}] IP blocked by YouTube: {e}")
             if attempt < max_retries - 1:
                 delay = base_delay * (2 ** attempt)
                 print(f"Retrying in {delay} seconds...")
                 time.sleep(delay)
             else:
-                raise e
+                break
+        except Exception as e:
+            last_error = e
+            print(f"[{label}] Transcript fetch failed: {e}")
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                print(f"Retrying in {delay} seconds...")
+                time.sleep(delay)
+            else:
+                break
+    if last_error is not None:
+        raise last_error
+    raise Exception("Transcript fetch failed")
 
-def generate_summary(transcript, language='English'):
-    # Get all available API keys from environment
-    api_keys = [
-        os.getenv("GEMINI_API_KEY"),
-        os.getenv("GEMINI_API_KEY_2"),
-        os.getenv("GEMINI_API_KEY_3")
-    ]
-    
-    # Filter out None values
-    api_keys = [key for key in api_keys if key]
-    
-    model_name = "gemini-2.0-flash"
-    
-    # Adjust prompt based on language
-    if 'Hindi' in language:
+
+def get_transcript(video_id):
+    """Fetch transcript: try direct connection first, then Webshare proxy if configured."""
+    routes = [("direct", _direct_http_session())]
+    proxy_sess = _proxy_http_session()
+    if proxy_sess:
+        ph = os.getenv("WEBSHARE_PROXY_HOST")
+        pp = os.getenv("WEBSHARE_PROXY_PORT")
+        routes.append((f"proxy {ph}:{pp}", proxy_sess))
+
+    last_exc = None
+    for label, session in routes:
+        try:
+            return _get_transcript_one_route(video_id, label, session)
+        except InvalidVideoId:
+            raise
+        except IpBlocked as e:
+            last_exc = e
+            print(f"Route {label} failed with IpBlocked, trying next route if any...")
+            continue
+        except Exception as e:
+            err = str(e).lower()
+            if "blocking" in err or "ip blocked" in err or "429" in err:
+                last_exc = e
+                print(f"Route {label} failed ({e}), trying next route if any...")
+                continue
+            raise
+
+    if last_exc is not None:
+        raise Exception(
+            "YouTube is blocking transcript requests from this network. "
+            "Try: wait and retry, use a VPN/residential proxy (set Webshare env vars), or a different network."
+        ) from last_exc
+    raise Exception("Unable to fetch transcript.")
+
+def _collect_exception_chain(exc: BaseException | None) -> list[BaseException]:
+    """Collect nested exceptions (__cause__, __context__); SDK often wraps gRPC / API errors."""
+    out: list[BaseException] = []
+    seen: set[int] = set()
+
+    def walk(e: BaseException | None) -> None:
+        if e is None or id(e) in seen:
+            return
+        seen.add(id(e))
+        out.append(e)
+        walk(e.__cause__)
+        if e.__context__ is not e.__cause__:
+            walk(e.__context__)
+
+    walk(exc)
+    return out
+
+
+def _gemini_error_text(exc: BaseException) -> str:
+    parts = []
+    for e in _collect_exception_chain(exc):
+        parts.append(str(e))
+        if getattr(e, "args", None):
+            parts.extend(str(a) for a in e.args if a)
+    return " ".join(parts).lower()
+
+
+def _is_retryable_gemini_quota_or_rate(exc: BaseException) -> bool:
+    """Transient quota / overload / RPC — retry with backoff or next key."""
+    for e in _collect_exception_chain(exc):
+        if isinstance(
+            e,
+            (
+                google_api_exceptions.ResourceExhausted,
+                google_api_exceptions.TooManyRequests,
+                google_api_exceptions.ServiceUnavailable,
+                google_api_exceptions.DeadlineExceeded,
+                google_api_exceptions.InternalServerError,
+            ),
+        ):
+            return True
+        if grpc and isinstance(e, grpc.RpcError):
+            code = e.code()
+            if code in (
+                grpc.StatusCode.RESOURCE_EXHAUSTED,
+                grpc.StatusCode.UNAVAILABLE,
+                grpc.StatusCode.DEADLINE_EXCEEDED,
+                grpc.StatusCode.ABORTED,
+            ):
+                return True
+    text = _gemini_error_text(exc)
+    return any(
+        phrase in text
+        for phrase in (
+            "429",
+            "quota",
+            "rate limit",
+            "rate_limit",
+            "resource exhausted",
+            "resource_exhausted",
+            "too many requests",
+            "exceeded your",
+            "exhausted",
+            "throttl",
+            "capacity",
+            "try again later",
+            "unavailable",
+            "temporarily",
+            "slow down",
+            "overloaded",
+        )
+    )
+
+
+GEMINI_ATTEMPTS = 3
+GEMINI_BACKOFF_BASE_SEC = 2.0
+
+
+def generate_summary(transcript, language="English"):
+    _reload_env_from_file()
+    api_key = _read_gemini_api_key()
+    if not api_key:
+        raise Exception(
+            "No GEMINI_API_KEY in .env. Add GEMINI_API_KEY=your_key to the .env file next to app.py."
+        )
+
+    genai.configure(api_key=api_key)
+    model_name = (os.getenv("GEMINI_MODEL") or "gemini-2.5-flash").strip() or "gemini-2.5-flash"
+    model = genai.GenerativeModel(model_name)
+
+    if "Hindi" in language:
         prompt = f"You have to summarize a YouTube video using its Hindi transcript in 10 points. Transcript: {transcript}"
     else:
         prompt = f"You have to summarize a YouTube video using its transcript in 10 points. Transcript: {transcript}"
-    
-    # Try each API key
-    last_error = None
-    for key_index, api_key in enumerate(api_keys, 1):
+
+    last_error: Exception | None = None
+    for attempt in range(GEMINI_ATTEMPTS):
         try:
-            print(f"🔑 Attempting with API Key {key_index}/{len(api_keys)}")
-            genai.configure(api_key=api_key)
-            
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(prompt, request_options={"timeout": 60})
-            print(f"✅ Summary generated successfully with Key {key_index}")
+            print(f"[key] Gemini attempt {attempt + 1}/{GEMINI_ATTEMPTS} model={model_name}")
+            response = model.generate_content(prompt, request_options={"timeout": 120})
+            print("[ok] Summary generated successfully")
             return response.text
-            
+
         except Exception as e:
-            error_msg = str(e)
             last_error = e
-            print(f"❌ Key {key_index} failed: {type(e).__name__}")
-            
-            # Check if it's a quota error
-            if "quota" in error_msg.lower() or "429" in error_msg:
-                print(f"⚠️  Quota exceeded for Key {key_index}, trying next key...")
-                if key_index < len(api_keys):
-                    continue
-                else:
-                    break
-            else:
-                # Other errors are not quota-related, re-raise
-                raise Exception(f"Unable to generate summary: {error_msg}")
-    
-    # All keys exhausted
-    raise Exception(f"Unable to generate summary: All {len(api_keys)} API keys quota exceeded. Please try again in a few moments.")
+            detail = _gemini_error_text(e)
+            print(f"[fail] {type(e).__name__}: {detail[:450]}")
+
+            if not _is_retryable_gemini_quota_or_rate(e):
+                raise Exception(f"Unable to generate summary: {detail}") from e
+
+            if attempt + 1 < GEMINI_ATTEMPTS:
+                delay = GEMINI_BACKOFF_BASE_SEC * (2**attempt)
+                print(f"[warn] Transient limit; sleeping {delay:.1f}s then retry...")
+                time.sleep(delay)
+
+    msg = (
+        f"Unable to generate summary: still rate-limited after {GEMINI_ATTEMPTS} attempt(s) with backoff. "
+        "Wait 1–2 minutes, try GEMINI_MODEL=gemini-1.5-flash, or enable billing for higher quota."
+    )
+    if last_error:
+        raise Exception(msg) from last_error
+    raise Exception(msg)
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)

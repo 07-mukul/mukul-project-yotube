@@ -289,7 +289,7 @@
             </small>
         </div>
         
-        <button onclick="summarizeVideo()" style="margin-bottom: 10px;">📝 Summarize Video</button>
+        <button type="button" id="summarizeBtn" onclick="summarizeVideo()" style="margin-bottom: 10px;">📝 Summarize Video</button>
         
         <div id="resultSection" class="result-section" style="display: none;">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
@@ -302,7 +302,9 @@
     </div>
     
     <script>
-        const API_URL = 'https://youtube-summarizer-r5ot.onrender.com';
+        const API_URL = (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1')
+            ? 'http://localhost:5000'
+            : 'https://youtube-summarizer-r5ot.onrender.com';
         let timerInterval = null;
         let elapsedSeconds = 0;
         
@@ -405,7 +407,7 @@
         
         async function summarizeVideo() {
             const youtubeUrl = document.getElementById('youtubeUrl').value.trim();
-            const summarizeBtn = event.target;
+            const summarizeBtn = document.getElementById('summarizeBtn');
             
             if (!youtubeUrl) {
                 showStatus('❌ Please enter a YouTube URL', 'error');
@@ -418,7 +420,10 @@
                 startLoadingAnimation();
                 
                 const startTime = Date.now();
-                const response = await fetch(`${API_URL}/summary?url=${encodeURIComponent(youtubeUrl)}`);
+                const response = await fetch(
+                    `${API_URL}/summary?url=${encodeURIComponent(youtubeUrl)}&_=${Date.now()}`,
+                    { cache: 'no-store' }
+                );
                 const data = await response.json();
                 const duration = (Date.now() - startTime) / 1000;
                 
@@ -442,6 +447,8 @@
                         document.getElementById('resultSection').style.display = 'block';
                     } else if (data.error_type === 'rate_limit') {
                         showStatus(`⏱️ ${errorMsg}`, 'error');
+                    } else if (data.error_type === 'invalid_api_key') {
+                        showStatus(`🔑 ${errorMsg}`, 'error');
                     } else {
                         showStatus(`❌ ${errorMsg}`, 'error');
                     }
@@ -451,7 +458,8 @@
                     
                     // Display language information
                     const langInfo = document.getElementById('languageInfo');
-                    langInfo.textContent = `📝 ${data.language || 'Unknown Language'} • ${duration.toFixed(2)}s`;
+                    const vid = data.video_id ? ` • ID ${data.video_id}` : '';
+                    langInfo.textContent = `📝 ${data.language || 'Unknown Language'} • ${duration.toFixed(2)}s${vid}`;
                     
                     // Display available languages
                     const availableLangs = document.getElementById('availableLangs');
@@ -483,7 +491,7 @@
         
         // Allow Enter key to summarize
         document.getElementById('youtubeUrl').addEventListener('keypress', (e) => {
-            if (e.key === 'Enter' && !document.querySelector('button:disabled')) {
+            if (e.key === 'Enter' && !document.getElementById('summarizeBtn').disabled) {
                 summarizeVideo();
             }
         });
