@@ -484,12 +484,21 @@ def _fetch_with_ytdlp(video_id):
                         if res.status_code == 200:
                             data = res.json()
                             text_parts = []
-                            for event in data.get('events', []):
-                                for seg in event.get('segs', []):
-                                    if seg.get('utf8'):
-                                        text_parts.append(seg['utf8'])
-                            full_text = " ".join(text_parts)
-                            return full_text, target_lang
+                            # Try json3 format (events/segs)
+                            if 'events' in data:
+                                for event in data.get('events', []):
+                                    for seg in event.get('segs', []):
+                                        if seg.get('utf8'):
+                                            text_parts.append(seg['utf8'])
+                            # Try simple srv3 format (body/p)
+                            elif 'body' in data:
+                                for p in data.get('body', {}).get('p', []):
+                                    if p.get('#text'):
+                                        text_parts.append(p['#text'])
+                            
+                            if text_parts:
+                                full_text = " ".join(text_parts)
+                                return full_text, target_lang
                 
                 return "Transcript detected but format not supported for direct extraction.", target_lang
     except Exception as e:
@@ -513,15 +522,17 @@ def get_transcript(video_id):
             print(f"[transcript] trying supadata for {video_id}...")
             res = requests.get(
                 "https://api.supadata.ai/v1/youtube/transcript",
-                params={"videoId": video_id, "lang": "en"},
+                params={"videoId": video_id, "text": True},
                 headers={"x-api-key": api_key},
                 timeout=30
             )
             if res.status_code == 200:
                 data = res.json()
-                content = data.get("content", [])
-                if content:
-                    text = " ".join([c["text"] for c in content])
+                text = data.get("content", "")
+                if not text and isinstance(data.get("content"), list):
+                    text = " ".join([c.get("text", "") for c in data["content"]])
+                
+                if text:
                     lang = data.get("lang", "en")
                     print(f"[ok] Supadata transcript fetched: {len(text)} chars")
                     return {
