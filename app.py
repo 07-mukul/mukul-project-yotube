@@ -1,5 +1,5 @@
 from flask import Flask, jsonify, request, send_from_directory
-import google.generativeai as genai
+from google import genai
 from google.api_core import exceptions as google_api_exceptions
 from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, InvalidVideoId
 from youtube_transcript_api._errors import IpBlocked, TranscriptsDisabled
@@ -36,15 +36,20 @@ def _read_gemini_api_key() -> str:
 app = Flask(__name__, static_folder='.', static_url_path='')
 CORS(app)
 
+def _get_genai_client():
+    api_key = _read_gemini_api_key()
+    if not api_key:
+        return None
+    return genai.Client(api_key=api_key)
+
 try:
-    genai.configure(api_key=_read_gemini_api_key() or None)
-    _k0 = _read_gemini_api_key()
-    if _k0:
-        print(f"[env] GEMINI_API_KEY loaded from .env (len={len(_k0)}, prefix={_k0[:4]}…)")
+    client = _get_genai_client()
+    if client:
+        print(f"[env] GEMINI_API_KEY loaded and GenAI client initialized")
     else:
         print("[env] WARNING: GEMINI_API_KEY is not set. The app will run but summaries will fail.")
 except Exception as e:
-    print(f"[env] CRITICAL: Failed to configure Gemini API. Error: {e}")
+    print(f"[env] CRITICAL: Failed to initialize GenAI client. Error: {e}")
 
 # Simple cache for summaries: {video_id: {"summary": ..., "language": ..., timestamp: ...}}
 summary_cache = {}
@@ -541,9 +546,9 @@ def generate_summary(transcript, language="English"):
             "No GEMINI_API_KEY in .env. Add GEMINI_API_KEY=your_key to the .env file next to app.py."
         )
 
-    genai.configure(api_key=api_key)
-    model_name = (os.getenv("GEMINI_MODEL") or "gemini-2.5-flash").strip() or "gemini-2.5-flash"
-    model = genai.GenerativeModel(model_name)
+    # Re-initialize client if necessary or use the global one
+    current_client = genai.Client(api_key=api_key)
+    model_name = (os.getenv("GEMINI_MODEL") or "gemini-2.0-flash").strip() or "gemini-2.0-flash"
 
     if "Hindi" in language:
         prompt = (
@@ -562,7 +567,10 @@ def generate_summary(transcript, language="English"):
     for attempt in range(GEMINI_ATTEMPTS):
         try:
             print(f"[key] Gemini attempt {attempt + 1}/{GEMINI_ATTEMPTS} model={model_name}")
-            response = model.generate_content(prompt, request_options={"timeout": 120})
+            response = current_client.models.generate_content(
+                model=model_name,
+                contents=prompt
+            )
             print("[ok] Summary generated successfully")
             return response.text
 
