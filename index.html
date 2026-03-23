@@ -521,16 +521,15 @@
         
         async function checkHealth() {
             try {
-                showStatus(`Checking server at ${API_URL}/health...`, 'loading');
-                const response = await fetch(`${API_URL}/health`, { mode: 'cors' }).catch(err => {
-                    throw new Error(`Failed to reach ${API_URL}. Is the backend running? (${err.message})`);
+                const targetUrl = API_URL ? `${API_URL}/health` : '/health';
+                showStatus(`Checking server at ${targetUrl}...`, 'loading');
+                const response = await fetch(targetUrl, { mode: 'cors' }).catch(err => {
+                    throw new Error(`Connection failed to ${targetUrl}. Is the backend running? (${err.message})`);
                 });
                 
                 const contentType = response.headers.get("content-type");
                 if (!contentType || !contentType.includes("application/json")) {
-                    const text = await response.text();
-                    console.error('[Health Check Response Body]', text);
-                    throw new Error(`The server at ${API_URL} returned HTML instead of JSON. You might be targeting the wrong port (3000 instead of 5000).`);
+                    throw new Error(`The server at ${targetUrl} returned HTML instead of JSON. You might be targeting the wrong port.`);
                 }
 
                 const data = await response.json();
@@ -543,20 +542,19 @@
         
         async function getAPI() {
             try {
-                showStatus(`Fetching API info from ${API_URL}...`, 'loading');
-                const response = await fetch(`${API_URL}/api-info`, { mode: 'cors' }).catch(err => {
-                    throw new Error(`Failed to reach ${API_URL}. (${err.message})`);
+                const targetUrl = API_URL ? `${API_URL}/api-info` : '/api-info';
+                showStatus(`Fetching API info from ${targetUrl}...`, 'loading');
+                const response = await fetch(targetUrl, { mode: 'cors' }).catch(err => {
+                    throw new Error(`Failed to reach ${targetUrl}. (${err.message})`);
                 });
 
                 const contentType = response.headers.get("content-type");
                 if (!contentType || !contentType.includes("application/json")) {
-                    const text = await response.text();
-                    console.error('[API Info Response Body]', text);
-                    throw new Error(`The server at ${API_URL} returned HTML instead of JSON. Current Origin: ${window.location.origin}`);
+                    throw new Error(`The server at ${targetUrl} returned HTML instead of JSON.`);
                 }
 
                 const data = await response.json();
-                let message = `API Status: ${data.status}\n\nURL: ${API_URL}\n\nEndpoints:\n`;
+                let message = `API Status: ${data.status}\n\nURL: ${targetUrl}\n\nEndpoints:\n`;
                 for (const [key, value] of Object.entries(data.endpoints || {})) {
                     message += `${key}: ${value}\n`;
                 }

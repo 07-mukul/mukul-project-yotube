@@ -97,7 +97,10 @@ def _looks_like_gemini_rate_limit(error_msg: str) -> bool:
 
 @app.route('/', methods=['GET'])
 def home():
-    return send_from_directory('.', 'index.html')
+    response = send_from_directory('.', 'index.html')
+    # Prevent caching of the main page during deployment updates
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return response
 
 
 @app.route('/health', methods=['GET'])
