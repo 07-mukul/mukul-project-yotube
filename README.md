@@ -31,7 +31,8 @@ This project is optimized for a single-service deployment on Render.
 ### 3. Add Environment Variables
 In the **Environment** tab on Render, add:
 - `GEMINI_API_KEY`: Your Google AI Studio key.
-- `GEMINI_MODEL`: `gemini-2.5-flash` (or your preferred model).
+  - `GEMINI_MODEL`: `gemini-2.0-flash` (or your preferred model).
+  - `SUPADATA_API_KEY`: (Optional) Your Supadata API key for premium transcript fetching.
 
 ### 4. Fixing "YouTube Blocking" on Render
 If you get a "YouTube is blocking your IP" error on Render, follow these steps:

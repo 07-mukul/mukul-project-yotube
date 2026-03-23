@@ -501,10 +501,40 @@ def _fetch_with_ytdlp(video_id):
 def get_transcript(video_id):
     """
     Tries multiple routes to get transcript:
-    1. Direct connection (with cookies)
-    2. Webshare Proxy (with cookies)
-    3. yt-dlp fallback
+    1. Supadata API (no IP blocking)
+    2. Direct connection (with cookies)
+    3. Webshare Proxy (with cookies)
+    4. yt-dlp fallback
     """
+    # Route 1: Supadata API
+    api_key = os.getenv("SUPADATA_API_KEY")
+    if api_key:
+        try:
+            print(f"[transcript] trying supadata for {video_id}...")
+            res = requests.get(
+                "https://api.supadata.ai/v1/youtube/transcript",
+                params={"videoId": video_id, "lang": "en"},
+                headers={"x-api-key": api_key},
+                timeout=30
+            )
+            if res.status_code == 200:
+                data = res.json()
+                content = data.get("content", [])
+                if content:
+                    text = " ".join([c["text"] for c in content])
+                    lang = data.get("lang", "en")
+                    print(f"[ok] Supadata transcript fetched: {len(text)} chars")
+                    return {
+                        "text": text,
+                        "language": "English" if lang.startswith("en") else lang,
+                        "available_languages": [lang]
+                    }
+            else:
+                print(f"[supadata] failed with status {res.status_code}: {res.text}")
+        except Exception as e:
+            print(f"[supadata] failed: {e}")
+
+    # Route 2 & 3: Direct + Proxy
     routes = [
         ("direct", _direct_http_session),
         ("proxy", _proxy_http_session),
@@ -526,13 +556,10 @@ def get_transcript(video_id):
             err_msg = str(e)
             print(f"[fail] {route_name} failed: {err_msg[:200]}")
             errors.append(f"{route_name}: {err_msg}")
-            
-            # If it's a "No transcript found" error, don't keep trying other routes
             if isinstance(e, (NoTranscriptFound, InvalidVideoId, TranscriptsDisabled)):
                 raise e
 
-    # 3. Last resort: yt-dlp (more resilient but slower)
-    # If we reached here, both direct and proxy failed with blocking/errors
+    # Route 4: yt-dlp fallback
     print(f"[transcript] trying ytdlp fallback for {video_id}...")
     try:
         ytdlp_text, ytdlp_lang = _fetch_with_ytdlp(video_id)
@@ -546,9 +573,7 @@ def get_transcript(video_id):
         print(f"[fail] ytdlp fallback failed: {e}")
         errors.append(f"ytdlp: {e}")
 
-    # If all else fails, raise a combined error
     detailed_errors = " | ".join(errors)
-    # Use a specific keyword that the frontend route handler looks for
     raise Exception(f"YouTube IP Blocked: {detailed_errors}")
 
 def _collect_exception_chain(exc: BaseException | None) -> list[BaseException]:
