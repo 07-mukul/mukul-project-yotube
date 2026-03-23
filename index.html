@@ -424,40 +424,21 @@
     
     <script>
         // --- API CONFIGURATION ---
+        // Since this is a single-service app, the frontend and backend are on the same host.
+        // We use an empty string for API_URL so all requests are relative to the current domain.
+        let API_URL = '';
+        
         const hostname = window.location.hostname;
         const protocol = window.location.protocol;
-        const currentPort = window.location.port;
         
-        // Default to the production URL
-        let detectedAPI = 'https://youtube-summarizer-r5ot.onrender.com';
-        
-        // If we are running on any local-like environment or from a file, try to reach port 5000 on localhost
-        const isLocal = hostname === 'localhost' || 
-                        hostname === '127.0.0.1' || 
-                        hostname === '' || // When running from file://
-                        protocol === 'file:' ||
-                        /^(192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)/.test(hostname) ||
-                        hostname.includes('preview.trae.com') || 
-                        hostname.includes('github.dev');
-
-        if (isLocal) {
-            // If the hostname contains -3000 (cloud IDE style), replace it with -5000
-            if (hostname.includes('-3000')) {
-                detectedAPI = `${protocol === 'https:' ? 'https:' : 'http:'}//${hostname.replace('-3000', '-5000')}`;
-            } else if (hostname.includes('3000')) {
-                detectedAPI = `${protocol}//${hostname.replace('3000', '5000')}`;
-            } else {
-                // Otherwise just try 127.0.0.1 on port 5000 (more reliable than 'localhost')
-                const hostToUse = (hostname === '' || hostname === 'localhost' || hostname === '127.0.0.1') ? '127.0.0.1' : hostname;
-                detectedAPI = `http://${hostToUse}:5000`;
-            }
+        // Fallback for local file protocol (if someone opens index.html directly)
+        if (protocol === 'file:' || hostname === '') {
+            API_URL = 'http://127.0.0.1:5000';
+            console.warn('[App] Running from file:// protocol. Using fallback API:', API_URL);
         }
-        
-        const API_URL = detectedAPI;
-        
-        console.log(`[App] Current Protocol: ${protocol}`);
+
         console.log(`[App] Current Host: ${window.location.host || 'local-file'}`);
-        console.log(`[App] Detected API: ${API_URL}`);
+        console.log(`[App] API Base Path: "${API_URL}"`);
         
         let timerInterval = null;
         let elapsedSeconds = 0;
