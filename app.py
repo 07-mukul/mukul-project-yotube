@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
 import google.generativeai as genai
 from google.api_core import exceptions as google_api_exceptions
 from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, InvalidVideoId
@@ -33,7 +33,7 @@ def _read_gemini_api_key() -> str:
     return raw.strip().strip("\ufeff").strip('"').strip("'")
 
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder='.', static_url_path='')
 CORS(app)
 
 genai.configure(api_key=_read_gemini_api_key() or None)
@@ -89,10 +89,23 @@ def _looks_like_gemini_rate_limit(error_msg: str) -> bool:
 
 @app.route('/', methods=['GET'])
 def home():
+    return send_from_directory('.', 'index.html')
+
+
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({
+        "status": "active",
+        "message": "Service is running"
+    }), 200
+
+
+@app.route('/api-info', methods=['GET'])
+def api_info():
     return jsonify({
         "status": "API is running",
         "endpoints": {
-            "GET /": "This message",
+            "GET /": "Frontend application",
             "GET /health": "Health check",
             "GET /summary?url=YOUTUBE_URL": "Summarize YouTube video from URL"
         }
@@ -506,9 +519,17 @@ def generate_summary(transcript, language="English"):
     model = genai.GenerativeModel(model_name)
 
     if "Hindi" in language:
-        prompt = f"You have to summarize a YouTube video using its Hindi transcript in 10 points. Transcript: {transcript}"
+        prompt = (
+            "You are a friendly and helpful assistant. Summarize the following YouTube video transcript "
+            "in Hindi. Provide exactly 10 clear, engaging points. Make the tone friendly and easy to understand. "
+            f"Transcript: {transcript}"
+        )
     else:
-        prompt = f"You have to summarize a YouTube video using its transcript in 10 points. Transcript: {transcript}"
+        prompt = (
+            "You are a friendly and helpful assistant. Summarize the following YouTube video transcript "
+            "in English. Provide exactly 10 clear, engaging points. Make the tone friendly and easy to understand. "
+            f"Transcript: {transcript}"
+        )
 
     last_error: Exception | None = None
     for attempt in range(GEMINI_ATTEMPTS):
