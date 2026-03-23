@@ -36,12 +36,15 @@ def _read_gemini_api_key() -> str:
 app = Flask(__name__, static_folder='.', static_url_path='')
 CORS(app)
 
-genai.configure(api_key=_read_gemini_api_key() or None)
-_k0 = _read_gemini_api_key()
-if _k0:
-    print(f"[env] GEMINI_API_KEY loaded from .env (len={len(_k0)}, prefix={_k0[:4]}…)")
-else:
-    print("[env] WARNING: GEMINI_API_KEY is empty after loading .env")
+try:
+    genai.configure(api_key=_read_gemini_api_key() or None)
+    _k0 = _read_gemini_api_key()
+    if _k0:
+        print(f"[env] GEMINI_API_KEY loaded from .env (len={len(_k0)}, prefix={_k0[:4]}…)")
+    else:
+        print("[env] WARNING: GEMINI_API_KEY is not set. The app will run but summaries will fail.")
+except Exception as e:
+    print(f"[env] CRITICAL: Failed to configure Gemini API. Error: {e}")
 
 # Simple cache for summaries: {video_id: {"summary": ..., "language": ..., timestamp: ...}}
 summary_cache = {}
@@ -308,8 +311,23 @@ def _proxy_http_session():
 
 def _fetch_transcript_with_session(video_id, session):
     """Core transcript fetch; raises library errors or Exception for no transcript text."""
+    # Check for cookies.txt in the same directory
+    cookies_path = os.path.join(os.path.dirname(__file__), 'cookies.txt')
+    cookies_arg = cookies_path if os.path.exists(cookies_path) else None
+    
+    if cookies_arg:
+        print(f"[auth] Using cookies from {cookies_path}")
+    
     yt_api = YouTubeTranscriptApi(http_client=session)
-    transcript_list = yt_api.list(video_id)
+    
+    try:
+        if cookies_arg:
+            transcript_list = yt_api.list(video_id, cookies=cookies_arg)
+        else:
+            transcript_list = yt_api.list(video_id)
+    except Exception as e:
+        print(f"Failed to list transcripts: {e}")
+        raise
 
     available_langs = set()
     available_langs.update(transcript_list._generated_transcripts.keys())
@@ -323,7 +341,10 @@ def _fetch_transcript_with_session(video_id, session):
 
     if any(lang.startswith("en") for lang in available_langs):
         try:
-            transcript_response = yt_api.fetch(video_id, languages=["en"])
+            if cookies_arg:
+                transcript_response = yt_api.fetch(video_id, languages=["en"], cookies=cookies_arg)
+            else:
+                transcript_response = yt_api.fetch(video_id, languages=["en"])
             language_used = "English"
             print("[ok] Using English transcript")
         except Exception as e:
@@ -331,7 +352,10 @@ def _fetch_transcript_with_session(video_id, session):
 
     if transcript_response is None and any(lang.startswith("hi") for lang in available_langs):
         try:
-            transcript_response = yt_api.fetch(video_id, languages=["hi"])
+            if cookies_arg:
+                transcript_response = yt_api.fetch(video_id, languages=["hi"], cookies=cookies_arg)
+            else:
+                transcript_response = yt_api.fetch(video_id, languages=["hi"])
             language_used = "Hindi"
             print("[ok] Using Hindi transcript")
         except Exception as e:
@@ -340,7 +364,10 @@ def _fetch_transcript_with_session(video_id, session):
     if transcript_response is None and available_langs:
         try:
             first_lang = available_langs[0]
-            transcript_response = yt_api.fetch(video_id, languages=[first_lang])
+            if cookies_arg:
+                transcript_response = yt_api.fetch(video_id, languages=[first_lang], cookies=cookies_arg)
+            else:
+                transcript_response = yt_api.fetch(video_id, languages=[first_lang])
             language_used = f"Language: {first_lang}"
             print(f"[ok] Using {first_lang} transcript")
         except Exception as e:

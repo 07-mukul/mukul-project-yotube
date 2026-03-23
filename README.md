@@ -33,6 +33,14 @@ In the **Environment** tab on Render, add:
 - `GEMINI_API_KEY`: Your Google AI Studio key.
 - `GEMINI_MODEL`: `gemini-2.5-flash` (or your preferred model).
 
+### 4. Fixing "YouTube Blocking" on Render
+If you get a "YouTube is blocking your IP" error on Render, follow these steps:
+1. **Install "Get cookies.txt LOCALLY"** extension in your Chrome/Edge browser.
+2. Go to YouTube.com and log in.
+3. Click the extension and download the `cookies.txt` file.
+4. **Upload `cookies.txt`** to your GitHub repository in the same folder as `app.py`.
+5. Re-deploy on Render. The app will now use your cookies to "pretend" to be a real user, bypassing the cloud IP block.
+
 ---
 
 ## 💻 Local Development
