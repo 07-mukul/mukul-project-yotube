@@ -472,9 +472,26 @@ def _fetch_with_ytdlp(video_id):
             else: target_lang = list(subtitles.keys())[0]
 
             if target_lang:
-                # yt-dlp subtitles are complex; for this script we return a placeholder
-                # indicating that the video is reachable and a fallback exists.
-                return "Transcript extracted via fallback.", target_lang
+                print(f"[ytdlp] found subtitles for {target_lang}")
+                # Fetch the subtitle content
+                subtitle_info = subtitles[target_lang]
+                # subtitle_info is a list of dicts, we want the one with ext='json' or 'vtt'
+                # For simplicity, we'll try to find a URL and fetch it
+                for sub in subtitle_info:
+                    if sub.get('ext') == 'json3': # YouTube's native format
+                        sub_url = sub.get('url')
+                        res = requests.get(sub_url)
+                        if res.status_code == 200:
+                            data = res.json()
+                            text_parts = []
+                            for event in data.get('events', []):
+                                for seg in event.get('segs', []):
+                                    if seg.get('utf8'):
+                                        text_parts.append(seg['utf8'])
+                            full_text = " ".join(text_parts)
+                            return full_text, target_lang
+                
+                return "Transcript detected but format not supported for direct extraction.", target_lang
     except Exception as e:
         print(f"[ytdlp] Error: {e}")
     
@@ -495,33 +512,44 @@ def get_transcript(video_id):
 
     errors = []
     for route_name, session_factory in routes:
-        session = session_factory()
-        if session is None:
-            continue
-
         try:
+            session = session_factory()
+            if session is None:
+                if route_name == "proxy":
+                    print("[transcript] skipping proxy (not configured)")
+                continue
+
             print(f"[transcript] trying {route_name} for {video_id}...")
-            return _get_transcript_one_route(video_id, route_name, session)
+            transcript_result = _get_transcript_one_route(video_id, route_name, session)
+            return transcript_result
         except Exception as e:
             err_msg = str(e)
             print(f"[fail] {route_name} failed: {err_msg[:200]}")
             errors.append(f"{route_name}: {err_msg}")
             
-            # If blocked, try next route immediately
-            if "blocked" in err_msg.lower() or "429" in err_msg:
-                continue
+            # If it's a "No transcript found" error, don't keep trying other routes
+            if isinstance(e, (NoTranscriptFound, InvalidVideoId, TranscriptsDisabled)):
+                raise e
 
     # 3. Last resort: yt-dlp (more resilient but slower)
+    # If we reached here, both direct and proxy failed with blocking/errors
     print(f"[transcript] trying ytdlp fallback for {video_id}...")
-    ytdlp_text, ytdlp_lang = _fetch_with_ytdlp(video_id)
-    if ytdlp_text:
-        return {
-            "text": ytdlp_text,
-            "language": ytdlp_lang,
-            "available_languages": [ytdlp_lang]
-        }
+    try:
+        ytdlp_text, ytdlp_lang = _fetch_with_ytdlp(video_id)
+        if ytdlp_text:
+            return {
+                "text": ytdlp_text,
+                "language": ytdlp_lang,
+                "available_languages": [ytdlp_lang]
+            }
+    except Exception as e:
+        print(f"[fail] ytdlp fallback failed: {e}")
+        errors.append(f"ytdlp: {e}")
 
-    raise Exception(f"YouTube is blocking all requests. Error details: {'; '.join(errors)}")
+    # If all else fails, raise a combined error
+    detailed_errors = " | ".join(errors)
+    # Use a specific keyword that the frontend route handler looks for
+    raise Exception(f"YouTube IP Blocked: {detailed_errors}")
 
 def _collect_exception_chain(exc: BaseException | None) -> list[BaseException]:
     """Collect nested exceptions (__cause__, __context__); SDK often wraps gRPC / API errors."""
