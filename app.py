@@ -11,6 +11,7 @@ from urllib.parse import urlparse, parse_qs
 from pathlib import Path
 import time
 import requests
+import http.cookiejar
 
 try:
     import grpc
@@ -296,9 +297,25 @@ def youtube_summarizer():
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 
+def _load_cookies_into_session(session):
+    """Load cookies from cookies.txt into the requests session if it exists."""
+    cookies_path = os.path.join(os.path.dirname(__file__), 'cookies.txt')
+    if os.path.exists(cookies_path):
+        try:
+            cj = http.cookiejar.MozillaCookieJar(cookies_path)
+            cj.load(ignore_discard=True, ignore_expires=True)
+            session.cookies.update(cj)
+            print(f"[auth] Successfully loaded cookies from {cookies_path}")
+            return True
+        except Exception as e:
+            print(f"[auth] Failed to load cookies: {e}")
+    return False
+
+
 def _direct_http_session():
     s = requests.Session()
     s.headers.update({"User-Agent": UA})
+    _load_cookies_into_session(s)
     return s
 
 
@@ -314,25 +331,17 @@ def _proxy_http_session():
     s = requests.Session()
     s.proxies.update({"http": proxy_url, "https": proxy_url})
     s.headers.update({"User-Agent": UA})
+    _load_cookies_into_session(s)
     return s
 
 
 def _fetch_transcript_with_session(video_id, session):
     """Core transcript fetch; raises library errors or Exception for no transcript text."""
-    # Check for cookies.txt in the same directory
-    cookies_path = os.path.join(os.path.dirname(__file__), 'cookies.txt')
-    cookies_arg = cookies_path if os.path.exists(cookies_path) else None
-    
-    if cookies_arg:
-        print(f"[auth] Using cookies from {cookies_path}")
-    
     yt_api = YouTubeTranscriptApi(http_client=session)
     
     try:
-        if cookies_arg:
-            transcript_list = yt_api.list(video_id, cookies=cookies_arg)
-        else:
-            transcript_list = yt_api.list(video_id)
+        # The session already contains cookies if they were available
+        transcript_list = yt_api.list(video_id)
     except Exception as e:
         print(f"Failed to list transcripts: {e}")
         raise
@@ -349,10 +358,7 @@ def _fetch_transcript_with_session(video_id, session):
 
     if any(lang.startswith("en") for lang in available_langs):
         try:
-            if cookies_arg:
-                transcript_response = yt_api.fetch(video_id, languages=["en"], cookies=cookies_arg)
-            else:
-                transcript_response = yt_api.fetch(video_id, languages=["en"])
+            transcript_response = yt_api.fetch(video_id, languages=["en"])
             language_used = "English"
             print("[ok] Using English transcript")
         except Exception as e:
@@ -360,10 +366,7 @@ def _fetch_transcript_with_session(video_id, session):
 
     if transcript_response is None and any(lang.startswith("hi") for lang in available_langs):
         try:
-            if cookies_arg:
-                transcript_response = yt_api.fetch(video_id, languages=["hi"], cookies=cookies_arg)
-            else:
-                transcript_response = yt_api.fetch(video_id, languages=["hi"])
+            transcript_response = yt_api.fetch(video_id, languages=["hi"])
             language_used = "Hindi"
             print("[ok] Using Hindi transcript")
         except Exception as e:
@@ -372,10 +375,7 @@ def _fetch_transcript_with_session(video_id, session):
     if transcript_response is None and available_langs:
         try:
             first_lang = available_langs[0]
-            if cookies_arg:
-                transcript_response = yt_api.fetch(video_id, languages=[first_lang], cookies=cookies_arg)
-            else:
-                transcript_response = yt_api.fetch(video_id, languages=[first_lang])
+            transcript_response = yt_api.fetch(video_id, languages=[first_lang])
             language_used = f"Language: {first_lang}"
             print(f"[ok] Using {first_lang} transcript")
         except Exception as e:
