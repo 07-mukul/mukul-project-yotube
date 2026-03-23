@@ -367,6 +367,88 @@
             font-weight: 700 !important;
             border: 1px solid #e0e7ff !important;
         }
+
+        /* Responsive Mobile Adjustments */
+        @media (max-width: 768px) {
+            body {
+                padding: 15px 10px;
+            }
+
+            .container {
+                padding: 30px 20px;
+                border-radius: 24px;
+            }
+
+            h1 {
+                font-size: 26px;
+                margin-bottom: 8px;
+            }
+
+            .subtitle {
+                font-size: 15px;
+                margin-bottom: 30px;
+            }
+
+            .button-group {
+                gap: 12px;
+                margin-bottom: 25px;
+            }
+
+            .button-group button {
+                padding: 12px;
+                font-size: 13px;
+            }
+
+            input[type="text"] {
+                padding: 15px 20px;
+                font-size: 15px;
+            }
+
+            button {
+                padding: 16px;
+                font-size: 16px;
+            }
+
+            .result-section h2 {
+                font-size: 22px;
+            }
+
+            .summary-content {
+                padding: 20px 18px;
+                font-size: 16px;
+            }
+
+            .summary-intro {
+                font-size: 18px;
+                margin-bottom: 15px;
+            }
+
+            .summary-text {
+                font-size: 15px;
+            }
+            
+            .loader-container {
+                padding: 30px 20px;
+            }
+            
+            .timer {
+                font-size: 24px;
+            }
+        }
+
+        @media (max-width: 480px) {
+            .button-group {
+                grid-template-columns: 1fr;
+            }
+            
+            .container {
+                padding: 25px 15px;
+            }
+            
+            h1 {
+                font-size: 22px;
+            }
+        }
     </style>
 </head>
 <body>
