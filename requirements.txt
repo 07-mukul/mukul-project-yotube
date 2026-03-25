@@ -11,3 +11,4 @@ torch>=2.6.0
 tokenizers>=0.21.0
 sentencepiece>=0.2.0
 protobuf>=5.29.0
+gradio==4.19.2

@@ -11,6 +11,8 @@ import time
 import requests
 import http.cookiejar
 import yt_dlp
+import gradio as gr
+import threading
 
 # Local transformer imports
 from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
@@ -1257,5 +1259,58 @@ def _format_summary_points(chunk_summaries, language, is_lyrics=False, frequent_
     return header + "\n" + "\n".join(formatted)
 
 
+def gradio_summarize(url, style):
+    """Gradio wrapper for the summarization logic"""
+    if not url:
+        return "Please enter a YouTube URL"
+    
+    video_id = get_video_id(url)
+    if not video_id:
+        return "Invalid YouTube URL"
+        
+    try:
+        # Load model if not loaded
+        global summarizer
+        if summarizer is None:
+            load_summarization_model()
+            
+        transcript_data = get_transcript(video_id)
+        result = generate_summary(transcript_data['text'], transcript_data['language'], style=style.lower())
+        return result['summary']
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+def launch_gradio():
+    """Launch Gradio interface"""
+    with gr.Blocks(title="YouTube Summarizer") as demo:
+        gr.Markdown("# 🎥 YouTube Video Summarizer")
+        gr.Markdown("Generate high-quality, 12-point storytelling summaries from any YouTube video.")
+        
+        with gr.Row():
+            with gr.Column():
+                url_input = gr.Textbox(label="YouTube Video URL", placeholder="https://www.youtube.com/watch?v=...")
+                style_dropdown = gr.Dropdown(
+                    label="Summary Style", 
+                    choices=["Bullet", "Story", "Short", "Takeaways"], 
+                    value="Bullet"
+                )
+                submit_btn = gr.Button("📝 Summarize Video", variant="primary")
+            
+            with gr.Column():
+                output_text = gr.Textbox(label="Summary Output", lines=20)
+        
+        submit_btn.click(
+            fn=gradio_summarize,
+            inputs=[url_input, style_dropdown],
+            outputs=output_text
+        )
+        
+    demo.launch(server_name="0.0.0.0", server_port=7860, share=False)
+
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    # Load model at startup
+    load_summarization_model()
+    
+    # Start Gradio in a separate thread if you still want Flask (or just run Gradio)
+    # Hugging Face Spaces with 'sdk: gradio' expects the app to run on port 7860
+    launch_gradio()
