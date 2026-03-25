@@ -293,33 +293,46 @@
         
         .summary-content {
             width: 100%;
-            padding: 25px 30px;
+            padding: 20px 25px; /* More padding for large text */
             background: #fcfdfe;
             border: 1px solid #edf2f7;
             border-radius: 20px;
-            font-size: 18px; /* Bigger text */
-            line-height: 1.6;
-            color: #1a202c; /* Darker for better contrast */
+            font-size: 19px; /* Larger text as requested */
+            line-height: 1.5; /* Better spacing for readability */
+            color: #1a202c;
             white-space: pre-wrap;
             box-shadow: 0 4px 15px rgba(0,0,0,0.02);
             min-height: auto;
         }
 
+        .summary-grid {
+            display: grid;
+            grid-template-columns: 1fr; /* One point per line as requested */
+            gap: 12px; /* More space between lines */
+        }
+
+        @media (max-width: 600px) {
+            .summary-grid {
+                grid-template-columns: 1fr; /* Stack on mobile */
+            }
+        }
+
         .summary-intro {
-            font-size: 20px;
+            font-size: 20px; /* Larger intro */
             font-weight: 800;
             color: #667eea;
             margin-bottom: 20px;
             padding-bottom: 15px;
             border-bottom: 2px dashed #eef2ff;
             line-height: 1.4;
+            width: 100%;
         }
 
         .summary-point {
-            margin-bottom: 10px;
+            margin-bottom: 12px; /* Space between points */
             display: flex;
             align-items: flex-start;
-            padding: 4px 0;
+            padding: 8px 0; /* More padding for points */
             border-radius: 0;
             background: transparent;
             border: none;
@@ -333,8 +346,8 @@
         }
 
         .summary-point-icon {
-            margin-right: 12px;
-            font-size: 12px;
+            margin-right: 15px;
+            font-size: 14px; /* Slightly larger icon */
             flex-shrink: 0;
             background: transparent;
             width: auto;
@@ -344,13 +357,14 @@
             justify-content: center;
             border-radius: 0;
             color: #667eea;
-            padding-top: 8px;
+            padding-top: 10px;
         }
 
         .summary-text {
             flex-grow: 1;
             padding-top: 0;
-            font-weight: 700; /* Bold text */
+            font-size: 19px; /* Larger text for points */
+            font-weight: 700; /* Bold text for readability */
         }
 
         #debugApiUrl {
@@ -702,18 +716,28 @@
                     
                     // Format the summary text into beautiful points
                     const rawSummary = data.data;
+                    if (!rawSummary) {
+                        showStatus('❌ Error: Summary data is missing or empty.', 'error');
+                        return;
+                    }
                     const points = rawSummary.split(/\n+/).filter(p => p.trim().length > 0);
                     
-                    let formattedHTML = '';
+                    let introHTML = '';
+                    let pointsHTML = '';
                     
                     points.forEach((point, index) => {
-                        const cleanPoint = point.replace(/^\d+\.\s*/, '').replace(/^[-*•]\s*/, '').trim();
+                        // Clean any existing bullet/number markers
+                        const cleanPoint = point.replace(/^\d+\.\s*/, '')
+                                               .replace(/^[-*•●]\s*/, '')
+                                               .replace(/^📖\s*/, '')
+                                               .replace(/^✨\s*/, '')
+                                               .trim();
                         
-                        // Treat the first point as a headline/intro if it doesn't look like a numbered point
-                        if (index === 0 && !point.match(/^\d+\./)) {
-                            formattedHTML += `<div class="summary-intro">✨ ${cleanPoint}</div>`;
+                        // Treat the first point as a headline/intro if it doesn't look like a storytelling point
+                        if (index === 0 && !point.startsWith('●') && !point.startsWith('1.')) {
+                            introHTML = `<div class="summary-intro">📖 ${cleanPoint}</div>`;
                         } else {
-                            formattedHTML += `
+                            pointsHTML += `
                                 <div class="summary-point">
                                     <div class="summary-point-icon">●</div>
                                     <div class="summary-text">${cleanPoint}</div>
@@ -722,7 +746,10 @@
                         }
                     });
                     
-                    document.getElementById('summary').innerHTML = formattedHTML;
+                    document.getElementById('summary').innerHTML = `
+                        ${introHTML}
+                        <div class="summary-grid">${pointsHTML}</div>
+                    `;
                     
                     // Display language information
                     const langInfo = document.getElementById('languageInfo');

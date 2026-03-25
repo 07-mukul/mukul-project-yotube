@@ -6,3 +6,5 @@ node_modules/
 .DS_Store
 *.log
 .vscode/
+flan-t5-base/
+cookies.txt

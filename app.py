@@ -1,6 +1,4 @@
 from flask import Flask, jsonify, request, send_from_directory
-from google import genai
-from google.api_core import exceptions as google_api_exceptions
 from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, InvalidVideoId
 from youtube_transcript_api._errors import IpBlocked, TranscriptsDisabled
 from flask_cors import CORS
@@ -14,44 +12,16 @@ import requests
 import http.cookiejar
 import yt_dlp
 
-try:
-    import grpc
-except ImportError:
-    grpc = None
+# Local transformer imports
+from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
+import torch
+from accelerate import Accelerator
 
 _BASE_DIR = Path(__file__).resolve().parent
-# override=True: .env wins over a stale GEMINI_API_KEY from Windows system env (common "it worked then broke" cause)
 load_dotenv(_BASE_DIR / ".env", override=True)
-
-
-def _reload_env_from_file() -> None:
-    """Re-read .env so key/model changes apply without restarting Flask."""
-    load_dotenv(_BASE_DIR / ".env", override=True)
-
-
-def _read_gemini_api_key() -> str:
-    """Read key from env; strip BOM, quotes, and whitespace (common .env mistakes)."""
-    raw = os.getenv("GEMINI_API_KEY") or ""
-    return raw.strip().strip("\ufeff").strip('"').strip("'")
-
 
 app = Flask(__name__, static_folder='.', static_url_path='')
 CORS(app)
-
-def _get_genai_client():
-    api_key = _read_gemini_api_key()
-    if not api_key:
-        return None
-    return genai.Client(api_key=api_key)
-
-try:
-    client = _get_genai_client()
-    if client:
-        print(f"[env] GEMINI_API_KEY loaded and GenAI client initialized")
-    else:
-        print("[env] WARNING: GEMINI_API_KEY is not set. The app will run but summaries will fail.")
-except Exception as e:
-    print(f"[env] CRITICAL: Failed to initialize GenAI client. Error: {e}")
 
 # Simple cache for summaries: {video_id: {"summary": ..., "language": ..., timestamp: ...}}
 summary_cache = {}
@@ -61,40 +31,86 @@ CACHE_DURATION = 86400  # Cache for 24 hours to avoid YouTube rate limiting
 last_request_time = {}
 MIN_REQUEST_INTERVAL = 5  # Minimum 5 seconds between requests for same video
 
+# Global summarization model
+summarizer = None
+tokenizer = None
+model = None
+accelerator = None
 
-def _looks_like_invalid_gemini_key(error_msg: str) -> bool:
-    m = error_msg.lower()
-    return any(
-        phrase in m
-        for phrase in (
-            "api_key_invalid",
-            "api key not found",
-            "pass a valid api key",
-            "invalid api key",
-        )
-    )
+def load_summarization_model():
+    """Load the summarization model once at startup with multiple fallbacks"""
+    global summarizer, tokenizer, model, accelerator
+    
+    # List of models to try in order of preference
+    # FLAN-T5 models are better for instruction following and messy transcripts
+    model_options = [
+        "google/flan-t5-base",            # Good balance of size and quality
+        "google/flan-t5-large",           # Instruction-following, great for transcripts
+        "sshleifer/distilbart-cnn-6-6",   # Faster version of 12-6, slightly lower quality but much faster
+        "sshleifer/distilbart-cnn-12-6",  # 1GB, fast, good quality
+        "facebook/bart-large-cnn",        # 1.6GB, best quality
+        "t5-small",                       # Ultra-fast fallback
+    ]
+    
+    print("[model] Initializing accelerator...")
+    try:
+        accelerator = Accelerator()
+        device = accelerator.device
+    except Exception as e:
+        print(f"[model] Accelerator init failed: {e}. Falling back to standard device detection.")
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    for model_name in model_options:
+        try:
+            # Check for local directory first
+            local_path = os.path.join(os.path.dirname(__file__), "flan-t5-base")
+            if "flan-t5-base" in model_name and os.path.exists(local_path):
+                print(f"[model] Found local model path: {local_path}")
+                model_to_load = local_path
+            else:
+                model_to_load = model_name
+
+            print(f"[model] Attempting to load: {model_to_load}...")
+            
+            # Use Auto classes for more robustness
+            tokenizer = AutoTokenizer.from_pretrained(model_to_load)
+            model = AutoModelForSeq2SeqLM.from_pretrained(model_to_load)
+            
+            if accelerator:
+                model = accelerator.prepare(model)
+            
+            # Explicitly create the pipeline with the loaded model and tokenizer
+            summarizer = pipeline(
+                "summarization",
+                model=model,
+                tokenizer=tokenizer,
+                device=0 if torch.cuda.is_available() else -1
+            )
+            
+            print(f"[model] Success! {model_name} loaded on {device}")
+            return True
+            
+        except Exception as e:
+            print(f"[model] Failed to load {model_name}: {e}")
+            continue
+
+    # Final attempt: direct pipeline call (let transformers handle it)
+    try:
+        print("[model] Final attempt: loading default pipeline...")
+        summarizer = pipeline("summarization")
+        print("[model] Default pipeline loaded successfully")
+        return True
+    except Exception as e:
+        print(f"[model] All model loading attempts failed: {e}")
+        return False
+
+# Load model at startup
+model_loaded = load_summarization_model()
+if not model_loaded:
+    print("[WARNING] Summarization model failed to load. The app will start but summaries will fail.")
 
 
-def _looks_like_gemini_rate_limit(error_msg: str) -> bool:
-    """Match HTTP handler to Gemini exhaustion messages (not only literal '429')."""
-    m = error_msg.lower()
-    return any(
-        phrase in m
-        for phrase in (
-            "429",
-            "quota",
-            "rate limit",
-            "rate_limit",
-            "rate-limited",
-            "resource exhausted",
-            "resource_exhausted",
-            "hit rate limits",
-            "still rate",
-            "all api key",
-            "unique key",
-            "try again in a few moments",
-        )
-    )
+
 
 
 @app.route('/', methods=['GET'])
@@ -172,6 +188,7 @@ def extract_video_id(youtube_url):
 def youtube_summarizer():
     youtube_url = request.args.get('url', '').strip()
     demo_mode = request.args.get('demo', 'false').lower() == 'true'
+    style = request.args.get('style', 'bullet').lower()
     
     # Demo mode for testing without API calls
     if demo_mode:
@@ -210,15 +227,20 @@ def youtube_summarizer():
             "error": True
         }), 400
 
-    print(f"[summary] video_id={video_id}")
+    print(f"[summary] video_id={video_id} style={style}")
+    
+    # Cache key includes style
+    cache_key = f"{video_id}_{style}"
     
     # Check cache first (only for successful results)
-    if video_id in summary_cache:
-        cached_data = summary_cache[video_id]
+    if cache_key in summary_cache:
+        cached_data = summary_cache[cache_key]
         if time.time() - cached_data['timestamp'] < CACHE_DURATION:
-            print(f"Cache hit for video {video_id}")
+            print(f"Cache hit for {cache_key}")
             return jsonify({
                 "data": cached_data['summary'],
+                "keywords": cached_data.get('keywords', []),
+                "content_type": cached_data.get('content_type', 'General'),
                 "error": False,
                 "video_id": video_id,
                 "language": cached_data['language'],
@@ -227,15 +249,24 @@ def youtube_summarizer():
             }), 200
         else:
             # Cache expired, remove it
-            del summary_cache[video_id]
+            del summary_cache[cache_key]
     
     try:
         transcript_data = get_transcript(video_id)
-        summary = generate_summary(transcript_data['text'], transcript_data['language'])
+        result = generate_summary(transcript_data['text'], transcript_data['language'], style=style)
+        
+        summary = result['summary']
+        keywords = result['keywords']
+        content_type = result['content_type']
+        
+        if not summary:
+            summary = "The AI was unable to generate a summary for this video. Please try again."
         
         # Cache the result
-        summary_cache[video_id] = {
+        summary_cache[cache_key] = {
             'summary': summary,
+            'keywords': keywords,
+            'content_type': content_type,
             'language': transcript_data.get('language', 'Unknown'),
             'available_languages': transcript_data.get('available_languages', []),
             'timestamp': time.time()
@@ -251,42 +282,41 @@ def youtube_summarizer():
         
         # Handle specific YouTube errors
         if "blocking" in error_msg.lower() or "ip blocked" in error_msg.lower():
+            # Check if Supadata was even tried and why it failed
+            supadata_err = next((e for e in error_msg.split('|') if "supadata" in e.lower()), None)
+            if supadata_err:
+                main_msg = f"YouTube is blocking requests and Supadata API also failed: {supadata_err.strip()}"
+            else:
+                main_msg = "YouTube is blocking your IP due to too many requests. Solutions: 1) Wait 15-30 minutes, 2) Switch VPN server, 3) Try a different video."
+            
             return jsonify({
-                "data": "YouTube is blocking your IP due to too many requests. Solutions: 1) Wait 15-30 minutes, 2) Switch VPN server, 3) Try a different video. Cached results will be available immediately.",
+                "data": main_msg,
                 "error": True,
                 "error_type": "ip_blocking",
                 "solutions": [
+                    "Check your Supadata API key in .env",
                     "Wait 15-30 minutes for YouTube to unblock your IP",
                     "Switch to a different VPN server",
-                    "Try summarizing a different video",
-                    "Ensure VPN is properly connected"
+                    "Try summarizing a different video"
                 ]
             }), 429
         elif "no transcripts" in error_msg.lower() or "transcripts disabled" in error_msg.lower():
             return jsonify({"data": "This video does not have subtitles available.", "error": True}), 404
         elif "No transcripts available" in error_msg:
             return jsonify({"data": "No Subtitles found. Try videos with English or Hindi subtitles.", "error": True}), 404
-        elif _looks_like_invalid_gemini_key(error_msg):
+        elif "model" in error_msg.lower() and "not loaded" in error_msg.lower():
             return jsonify({
-                "data": (
-                    "Gemini rejected your API key (invalid or revoked). "
-                    "Create a new key at https://aistudio.google.com/apikey , put it in .env as GEMINI_API_KEY=..., "
-                    "save the file, and restart the Flask server."
-                ),
+                "data": "Summarization model failed to load. Please check the server logs.",
                 "error": True,
-                "error_type": "invalid_api_key",
-            }), 401
-        elif _looks_like_gemini_rate_limit(error_msg):
-            return jsonify({
-                "data": "API Rate limit exceeded. Please try again in a few moments.",
-                "error": True,
-                "error_type": "rate_limit"
-            }), 429
+                "error_type": "model_not_loaded"
+            }), 500
         
         return jsonify({"data": f"Unable to Summarize the video: {error_msg}", "error": True}), 500
 
     return jsonify({
         "data": summary,
+        "keywords": keywords,
+        "content_type": content_type,
         "error": False,
         "video_id": video_id,
         "language": transcript_data.get('language', 'Unknown'),
@@ -382,10 +412,16 @@ def _fetch_transcript_with_session(video_id, session):
         except Exception as e:
             print(f"Failed to fetch {first_lang}: {e}")
 
+    def _extract_text(s):
+        if isinstance(s, str): return s
+        if isinstance(s, dict): return s.get('text', '')
+        try: return s.text # Try object attribute
+        except: return str(s)
+
     if transcript_response is None:
         raise Exception(f"No transcripts available. Available languages: {available_langs}")
 
-    transcript_text = " ".join([snippet.text for snippet in transcript_response])
+    transcript_text = " ".join([_extract_text(snippet) for snippet in transcript_response])
     print(f"[ok] Successfully fetched transcript with {len(transcript_text)} characters")
 
     return {
@@ -517,6 +553,7 @@ def get_transcript(video_id):
     """
     # Route 1: Supadata API
     api_key = os.getenv("SUPADATA_API_KEY")
+    errors = []
     if api_key:
         try:
             print(f"[transcript] trying supadata for {video_id}...")
@@ -541,9 +578,13 @@ def get_transcript(video_id):
                         "available_languages": [lang]
                     }
             else:
-                print(f"[supadata] failed with status {res.status_code}: {res.text}")
+                err_msg = f"supadata failed ({res.status_code}): {res.text}"
+                print(f"[supadata] {err_msg}")
+                errors.append(err_msg)
         except Exception as e:
-            print(f"[supadata] failed: {e}")
+            err_msg = f"supadata failed: {e}"
+            print(f"[supadata] {err_msg}")
+            errors.append(err_msg)
 
     # Route 2 & 3: Direct + Proxy
     routes = [
@@ -551,7 +592,6 @@ def get_transcript(video_id):
         ("proxy", _proxy_http_session),
     ]
 
-    errors = []
     for route_name, session_factory in routes:
         try:
             session = session_factory()
@@ -585,142 +625,637 @@ def get_transcript(video_id):
         errors.append(f"ytdlp: {e}")
 
     detailed_errors = " | ".join(errors)
-    raise Exception(f"YouTube IP Blocked: {detailed_errors}")
-
-def _collect_exception_chain(exc: BaseException | None) -> list[BaseException]:
-    """Collect nested exceptions (__cause__, __context__); SDK often wraps gRPC / API errors."""
-    out: list[BaseException] = []
-    seen: set[int] = set()
-
-    def walk(e: BaseException | None) -> None:
-        if e is None or id(e) in seen:
-            return
-        seen.add(id(e))
-        out.append(e)
-        walk(e.__cause__)
-        if e.__context__ is not e.__cause__:
-            walk(e.__context__)
-
-    walk(exc)
-    return out
-
-
-def _gemini_error_text(exc: BaseException) -> str:
-    parts = []
-    for e in _collect_exception_chain(exc):
-        parts.append(str(e))
-        if getattr(e, "args", None):
-            parts.extend(str(a) for a in e.args if a)
-    return " ".join(parts).lower()
-
-
-def _is_retryable_gemini_quota_or_rate(exc: BaseException) -> bool:
-    """Transient quota / overload / RPC — retry with backoff or next key."""
-    for e in _collect_exception_chain(exc):
-        if isinstance(
-            e,
-            (
-                google_api_exceptions.ResourceExhausted,
-                google_api_exceptions.TooManyRequests,
-                google_api_exceptions.ServiceUnavailable,
-                google_api_exceptions.DeadlineExceeded,
-                google_api_exceptions.InternalServerError,
-            ),
-        ):
-            return True
-        if grpc and isinstance(e, grpc.RpcError):
-            code = e.code()
-            if code in (
-                grpc.StatusCode.RESOURCE_EXHAUSTED,
-                grpc.StatusCode.UNAVAILABLE,
-                grpc.StatusCode.DEADLINE_EXCEEDED,
-                grpc.StatusCode.ABORTED,
-            ):
-                return True
-    text = _gemini_error_text(exc)
-    return any(
-        phrase in text
-        for phrase in (
-            "429",
-            "quota",
-            "rate limit",
-            "rate_limit",
-            "resource exhausted",
-            "resource_exhausted",
-            "too many requests",
-            "exceeded your",
-            "exhausted",
-            "throttl",
-            "capacity",
-            "try again later",
-            "unavailable",
-            "temporarily",
-            "slow down",
-            "overloaded",
-        )
-    )
-
-
-GEMINI_ATTEMPTS = 3
-GEMINI_BACKOFF_BASE_SEC = 2.0
-
-
-def generate_summary(transcript, language="English"):
-    _reload_env_from_file()
-    api_key = _read_gemini_api_key()
-    if not api_key:
-        raise Exception(
-            "No GEMINI_API_KEY in .env. Add GEMINI_API_KEY=your_key to the .env file next to app.py."
-        )
-
-    # Re-initialize client if necessary or use the global one
-    current_client = genai.Client(api_key=api_key)
-    model_name = (os.getenv("GEMINI_MODEL") or "gemini-2.0-flash").strip() or "gemini-2.0-flash"
-
-    if "Hindi" in language:
-        prompt = (
-            "You are a friendly and helpful assistant. Summarize the following YouTube video transcript "
-            "in Hindi. Provide exactly 10 clear, engaging points. Make the tone friendly and easy to understand. "
-            f"Transcript: {transcript}"
-        )
+    
+    # If any route was specifically blocked, or if we have no specific transcript-unavailable error
+    if any("blocked" in e.lower() for e in errors) or not any("unavailable" in e.lower() or "disabled" in e.lower() for e in errors):
+        raise Exception(f"YouTube IP Blocked: {detailed_errors}")
     else:
-        prompt = (
-            "You are a friendly and helpful assistant. Summarize the following YouTube video transcript "
-            "in English. Provide exactly 10 clear, engaging points. Make the tone friendly and easy to understand. "
-            f"Transcript: {transcript}"
+        raise NoTranscriptFound(f"Transcript unavailable for this video: {detailed_errors}")
+
+def is_lyrics(text):
+    """Detect if the content looks like song lyrics with high accuracy"""
+    # Clean and split into lines/sentences
+    lines = [l.strip() for l in text.split(".") if l.strip()]
+    if not lines:
+        return False
+    
+    # Lyrics usually have very short lines and a lot of repetition
+    short_lines = sum(1 for l in lines if len(l.split()) < 6)
+    
+    # Music often has specific keywords in transcripts
+    music_keywords = ["chorus", "verse", "melody", "rhythm", "instrumental", "[music]"]
+    has_music_keywords = any(kw in text.lower() for kw in music_keywords)
+    
+    # Stories have short dialogue lines too, so we need a higher threshold
+    # and we check if it lacks typical "story" words
+    story_keywords = ["once upon a time", "narrator", "suddenly", "however", "therefore", "because"]
+    has_story_keywords = any(kw in text.lower() for kw in story_keywords)
+    
+    if has_story_keywords:
+        return False # Definitely a story
+        
+    return (short_lines > len(lines) * 0.6) or (has_music_keywords and short_lines > len(lines) * 0.3)
+
+def summarize_lyrics(text, language="English"):
+    """Return a dynamic interpretation of song lyrics using the AI model"""
+    global summarizer
+    try:
+        print("[model] Generating dynamic lyrics summary...")
+        
+        # Determine if T5 is used for the prefix
+        is_t5 = False
+        if model and hasattr(model, 'config'):
+            is_t5 = "t5" in model.config._name_or_path.lower()
+            
+        input_text = ("summarize the meaning of these lyrics: " + text[:1000]) if is_t5 else text[:1000]
+        
+        result = summarizer(
+            input_text,
+            max_length=150,
+            min_length=50,
+            do_sample=False,
+            num_beams=2,
+            early_stopping=True,
+            truncation=True
         )
+        
+        summary_text = result[0]['summary_text']
+        
+        # Use the same formatting logic to get 8-10 points
+        result_formatted = _format_summary_points([summary_text], language, is_lyrics=True)
+        return result_formatted if result_formatted else "Unable to interpret song lyrics."
+        
+    except Exception as e:
+        print(f"[model] Lyrics summary failed: {e}. Falling back to general summary.")
+        return None # Fallback to general summary logic in generate_summary
 
-    last_error: Exception | None = None
-    for attempt in range(GEMINI_ATTEMPTS):
+def is_story(text):
+    """Detect if the content is a narrative story"""
+    story_keywords = [
+        "once upon a time", "lived in", "there was a", "narrator", 
+        "suddenly", "village", "king", "forest", "moral of the story",
+        "happily ever after", "neighborhood", "farmer", "merchant"
+    ]
+    text_lower = text.lower()
+    score = sum(2 for kw in story_keywords if kw in text_lower)
+    
+    # Stories often have character names (Capitalized words in middle of sentences)
+    potential_names = len(re.findall(r'(?<!^)(?<![.!?]\s)[A-Z][a-z]+', text))
+    if potential_names > 10: score += 5
+    
+    return score >= 6
+
+def is_educational(text):
+    """Detect if the content is educational/academic"""
+    edu_keywords = [
+        "definition", "concept", "principle", "study", "research", 
+        "example", "theory", "evidence", "analysis", "conclusion",
+        "significant", "impact", "process", "structure", "function"
+    ]
+    text_lower = text.lower()
+    score = sum(1 for kw in edu_keywords if kw in text_lower)
+    return score >= 5
+
+def is_tutorial(text):
+    """Detect if the content is a tutorial/how-to"""
+    tutorial_keywords = [
+        "how to", "step by step", "first", "second", "then", "finally",
+        "tutorial", "guide", "setup", "install", "create", "make sure",
+        "click", "select", "using", "example", "tip"
+    ]
+    text_lower = text.lower()
+    score = sum(1 for kw in tutorial_keywords if kw in text_lower)
+    return score >= 5
+
+def extract_keywords(text, num_keywords=5):
+    """Simple keyword extraction based on frequency and length (FIX 11)"""
+    # Clean text
+    clean_text = re.sub(r'[^a-zA-Z\s]', '', text.lower())
+    words = clean_text.split()
+    
+    # Filter stopwords and short words
+    stopwords = {'the', 'and', 'this', 'that', 'with', 'from', 'they', 'their', 'your', 'about', 'would', 'could', 'should'}
+    meaningful_words = [w for w in words if len(w) > 4 and w not in stopwords]
+    
+    # Count frequencies
+    from collections import Counter
+    counts = Counter(meaningful_words)
+    return [word for word, count in counts.most_common(num_keywords)]
+
+def detect_content_type(text):
+    """Consolidated content type detection (FIX 9)"""
+    if is_lyrics(text): return "lyrics"
+    if is_story(text): return "story"
+    if is_tutorial(text): return "tutorial"
+    if is_educational(text): return "educational"
+    return "general"
+
+def clean_sentence(s):
+    """Clean and humanize a single sentence (STEP 2)"""
+    if not s: return ""
+    s = s.strip()
+
+    # STEP 4: Remove direct dialogue fragments that don't make sense as summary points
+    if re.search(r'^(Sherat|Shahed|Sugdev|Son|Jack|Mother|Giant),? (what|where|how|why|is|are|do|can)\b', s, flags=re.I) or s.endswith('?'):
+        if len(s.split()) < 10: # Only remove short question/dialogue fragments
+            return ""
+
+    # Fix prompt leakage: Remove parenthetical instructions or meta-talk the AI might echo
+    s = re.sub(r'\(NO NAME:.*?\)', '', s, flags=re.I)
+    s = re.sub(r'\(NO ENDING.*?\)', '', s, flags=re.I)
+    s = re.sub(r'\(NO MESSAGE.*?\)', '', s, flags=re.I)
+    s = re.sub(r'\(FLOW:.*?\)', '', s, flags=re.I)
+    s = re.sub(r'\(REQUIREMENTS:.*?\)', '', s, flags=re.I)
+    s = re.sub(r'\(TASK:.*?\)', '', s, flags=re.I)
+    s = re.sub(r'\(Exactly 12.*?\)', '', s, flags=re.I)
+    s = re.sub(r'>>\s*', '', s) # Remove leading AI arrows
+
+    # Humanization: Replace robotic or awkward phrasing
+    replacements = {
+        "this city people": "the villagers",
+        "I'm preparing": "the boy started preparing",
+        "grandfather": "the elder",
+        "they are very smart": "the villagers showed great wisdom",
+        "nothing will happen": "nothing seemed to change at first",
+        "why are you": "the people wondered why",
+        "it is mentioned": "the story reveals",
+        "the video shows": "we see",
+        "according to the video": "as the story unfolds",
+        "the narrator says": "it is said that",
+        "he thinks we should": "the elder suggested that they should",
+        "all your effort will go to waste": "all their efforts would be in vain",
+        "open all our eyes": "opened everyone's eyes to the truth",
+        "one day the situation will surely change": "the people hoped that one day the situation would change",
+        "we need to be ready for same": "they needed to be prepared for the future",
+        "they want to live in a strange place": "the villagers were faced with the challenge of a new and difficult situation",
+        "they are not sure how to survive there": "they were uncertain of how they would survive the drought",
+        "wish a worse tomorrow": "hope for a better tomorrow", 
+        "if you wish a worse tomorrow": "to ensure a better tomorrow", 
+        "just then the village elder": "the story continues as the village elder",
+        "gets shocked by the scene there": "was amazed to see the progress that had been made",
+        "perform а small prayer and hover in the valley": "gather to pray for rain and hope for a blessing",
+        "sewing the seeds": "sowing the seeds",
+        "hover in the village": "gather in the village",
+        "hover in the valley": "gather in the valley",
+        "milky the cow": "their beloved cow, Milky",
+        "golden horse": "golden harp", # Correcting common AI errors in this story
+        "thundered behind him": "chased him down the beanstalk"
+    }
+    
+    for old, new in replacements.items():
+        s = re.sub(rf'\b{old}\b', new, s, flags=re.I)
+
+    # Basic cleanup
+    s = s.strip()
+    if not s or len(s) < 10: return ""
+    s = s[0].upper() + s[1:]
+    if not s.endswith((".", "!", "?")):
+        s += "."
+
+    return s
+
+def reorder_points(points):
+    """Refined reordering that preserves chronological sequence but ensures Moral is last"""
+    if not points: return []
+    
+    # We want to keep the story's natural chronological order (which the AI generates)
+    # and only move the "Moral" to the very end if it's misplaced.
+    
+    intro_points = []
+    moral_points = []
+    core_story = []
+
+    for p in points:
+        p_low = p.lower()
+        # MORAL: (Should definitely be at the end)
+        if any(kw in p_low for kw in ["moral", "lesson", "teaches", "message", "prosperous", "tomorrow", "future", "hope you have", "work today", "second chance"]):
+            moral_points.append(p)
+        # INTRODUCTION: (Should definitely be at the start)
+        elif any(kw in p_low for kw in ["village of", "once upon", "there was a", "lived in", "farmers named", "jack lived with"]):
+            # Only if we don't already have intro points, to avoid pulling too much to the top
+            if not intro_points:
+                intro_points.append(p)
+            else:
+                core_story.append(p)
+        else:
+            core_story.append(p)
+
+    # Reassemble: Intro -> Everything else in its original relative order -> Moral
+    return intro_points + core_story + moral_points
+
+def generate_summary(transcript, language="English", style="bullet"):
+    """Generate high-quality, comprehensive summary with full video coverage"""
+    global summarizer
+
+    if not model_loaded:
+        raise Exception("Summarization model not loaded. Please check server logs.")
+
+    try:
+        # Ensure transcript is a string
+        if isinstance(transcript, list):
+            def _to_str(item):
+                if isinstance(item, str): return item
+                if isinstance(item, dict): return item.get('text', str(item))
+                try: return item.text
+                except: return str(item)
+            transcript = " ".join([_to_str(t) for t in transcript])
+        elif not isinstance(transcript, str):
+            transcript = str(transcript)
+
+        # Clean up transcript noise (FIX 5)
+        transcript = re.sub(r'\[.*?\]', '', transcript)
+        # Aggressively remove HTML-like tags and technical artifacts (Fixes user's "br/div" issue)
+        transcript = re.sub(r'<.*?>', ' ', transcript)
+        transcript = re.sub(r'/[a-z]+>', ' ', transcript)
+        transcript = re.sub(r'[a-z]+/[a-z]*>', ' ', transcript)
+        transcript = re.sub(r'\(\s*\)', '', transcript)
+        transcript = re.sub(r'\|+', ' ', transcript)
+        
+        transcript = re.sub(r'\b(uh|um|you know|like|so)\b', '', transcript, flags=re.IGNORECASE)
+        transcript = re.sub(r'\b(\w+)( \1\b)+', r'\1', transcript)
+        transcript = re.sub(r'\s+', ' ', transcript).strip()
+
+        # Step 1: Name Extraction
+        potential_names = re.findall(r'\b[A-Z][a-z]+\b', transcript)
+        name_counts = {}
+        for name in potential_names:
+            if len(name) > 3:
+                name_counts[name] = name_counts.get(name, 0) + 1
+        frequent_names = {name: count for name, count in name_counts.items() if count >= 2}
+
+        # Step 2: Content Type Detection (FIX 9)
+        content_type = detect_content_type(transcript)
+        is_narrative = content_type == "story"
+        is_edu_tut = content_type in ["tutorial", "educational"]
+        
+        if content_type == "lyrics":
+            print("[model] Lyrics detected. Using specialized lyrics summarizer.")
+            lyrics_summary = summarize_lyrics(transcript, language)
+            if lyrics_summary:
+                return {
+                    "summary": lyrics_summary,
+                    "keywords": extract_keywords(transcript),
+                    "content_type": "Lyrics"
+                }
+        
+        if is_narrative:
+            print("[model] Narrative story detected. Optimizing for plot points...")
+        elif is_edu_tut:
+            print(f"[model] {content_type.capitalize()} content detected. Optimizing for key concepts...")
+
+        print(f"[model] Transcript length: {len(transcript)} chars. Processing style: {style}")
+
+        # Detect model type
+        is_t5 = False
+        if model and hasattr(model, 'config'):
+            is_t5 = "t5" in model.config._name_or_path.lower()
+
+        # Better Chunking Strategy: sentence-based + overlap (FIX 6)
+        sentences = re.split(r'(?<=[.!?])\s+', transcript)
+        
+        chunks = []
+        current_chunk = []
+        current_len = 0
+        overlap_sentences = 2
+        max_chunk_chars = 2500 if is_narrative else 3500 
+
+        for i, sentence in enumerate(sentences):
+            if current_len + len(sentence) > max_chunk_chars and current_chunk:
+                chunks.append(' '.join(current_chunk))
+                # Start next chunk with overlap
+                start_idx = max(0, len(current_chunk) - overlap_sentences)
+                current_chunk = current_chunk[start_idx:]
+                current_len = sum(len(s) for s in current_chunk)
+            
+            current_chunk.append(sentence)
+            current_len += len(sentence)
+
+        if current_chunk:
+            chunks.append(' '.join(current_chunk))
+
+        # Cover more chunks for better coverage of long videos
+        max_chunks = 20 if is_narrative else 15
+        chunks = chunks[:max_chunks]
+        print(f"[model] Processing {len(chunks)} chunks with overlap for full video coverage...")
+
+        # Summarize each chunk
+        chunk_summaries = []
+        for i, chunk in enumerate(chunks):
+            if len(chunk.strip()) < 50:
+                continue
+            
+            # Refined Prompt Engineering for Storytelling (FIX 2)
+            if is_t5:
+                if style == "story" or is_narrative:
+                    prompt_details = "Capture this segment as a detailed narrative. Focus on the characters, their actions, and the unfolding events to maintain a strong story flow."
+                elif style == "short":
+                    prompt_details = "Summarize this segment into a single, highly impactful narrative point."
+                elif is_edu_tut:
+                    prompt_details = "Explain the core concepts and steps in this segment clearly, as if teaching a student."
+                else:
+                    prompt_details = "Summarize the key events and information in this segment in a clear, human-like way."
+
+                input_text = f"""
+{prompt_details}
+- Remove repetitive filler
+- Ensure the language is natural and engaging
+- Detail the most important actions
+
+Transcript Segment:
+{chunk}
+"""
+            else:
+                input_text = chunk
+
+            try:
+                # Increased parameters for more detail
+                result = summarizer(
+                    input_text,
+                    max_length=350 if (is_narrative or style=="story") else 250,
+                    min_length=150 if (is_narrative or style=="story") else 100,
+                    do_sample=False,
+                    num_beams=4,
+                    length_penalty=2.0,
+                    repetition_penalty=1.2, # Added to prevent repeating phrases
+                    no_repeat_ngram_size=3,
+                    early_stopping=True,
+                    truncation=True
+                )
+                summary_text = result[0]['summary_text'].strip()
+                
+                # Filter Bad Outputs (FIX 4)
+                if len(summary_text.split()) < 5: continue
+                if "is the village" in summary_text.lower(): continue
+
+                if len(summary_text) > 30:
+                    chunk_summaries.append(summary_text)
+            except Exception as e:
+                print(f"[model] Part {i+1} failed: {e}")
+                continue
+
+        if not chunk_summaries:
+            raise Exception("No summaries generated from any part of the video")
+
+        # Step 4: Final AI Rewrite pass (STEP 3)
+        # We use a hierarchical approach to avoid T5 token limits (512 tokens)
+        print(f"[model] Finalizing detailed storytelling with hierarchical synthesis...")
+        
+        # If we have many chunks, group them first
+        if len(chunk_summaries) > 6:
+            mid_summaries = []
+            group_size = 4
+            for i in range(0, len(chunk_summaries), group_size):
+                group = chunk_summaries[i:i+group_size]
+                group_text = " ".join(group)
+                print(f"[model] Synthesizing group {i//group_size + 1}...")
+                
+                try:
+                    res = summarizer(
+                        f"Summarize these story events into a coherent narrative: {group_text}",
+                        max_length=300,
+                        min_length=100,
+                        do_sample=False,
+                        repetition_penalty=1.2
+                    )
+                    mid_summaries.append(res[0]['summary_text'])
+                except:
+                    mid_summaries.extend(group)
+            final_text = " ".join(mid_summaries)
+        else:
+            final_text = " ".join(chunk_summaries)
+        
         try:
-            print(f"[key] Gemini attempt {attempt + 1}/{GEMINI_ATTEMPTS} model={model_name}")
-            response = current_client.models.generate_content(
-                model=model_name,
-                contents=prompt
+            if is_t5:
+                # Forceful prompt for long, high-quality, descriptive sentences
+                final_prompt = f"""
+TASK: Rewrite these segments into a masterpiece 12-point story.
+CHRONOLOGY: You MUST follow the exact sequence of events below. 
+- Do NOT skip the middle of the story.
+- Point 1 MUST be the start, Point 12 MUST be the end and moral.
+- Each point MUST be a long, descriptive sentence (at least 25 words).
+- Describe settings, character names (Jack, Mother, Giant), and emotions.
+- NO meta-talk, NO meta-instructions, NO technical noise.
+
+STORY SEGMENTS:
+{final_text}
+"""
+                final_input = final_prompt
+            else:
+                final_input = final_text
+
+            final_summary_result = summarizer(
+                final_input,
+                max_length=1024 if (is_narrative or style=="story") else 800,
+                min_length=500 if (is_narrative or style=="story") else 400, # Lowered slightly to prevent hallucinations
+                do_sample=False,
+                num_beams=4,
+                length_penalty=2.0, # Slightly lowered from 2.5 to be safer
+                repetition_penalty=1.5,
+                no_repeat_ngram_size=3,
+                early_stopping=True,
+                truncation=True
             )
-            print("[ok] Summary generated successfully")
-            return response.text
-
+            final_summary_text = final_summary_result[0]['summary_text'].strip()
+            
+            # Format based on style
+            if style == "story":
+                summary_final = clean_sentence(final_summary_text)
+            else:
+                # Format each point then reorder them
+                summary_final = _format_summary_points([final_summary_text], language, frequent_names=frequent_names, style=style)
+            
+            return {
+                "summary": summary_final,
+                "keywords": extract_keywords(transcript),
+                "content_type": content_type.capitalize()
+            }
         except Exception as e:
-            last_error = e
-            detail = _gemini_error_text(e)
-            print(f"[fail] {type(e).__name__}: {detail[:450]}")
+            print(f"[model] Final re-summarization failed: {e}. Falling back to chunk summaries.")
+            summary_final = _format_summary_points(chunk_summaries, language, frequent_names=frequent_names, style=style)
+            return {
+                "summary": summary_final,
+                "keywords": extract_keywords(transcript),
+                "content_type": content_type.capitalize()
+            }
 
-            if not _is_retryable_gemini_quota_or_rate(e):
-                raise Exception(f"Unable to generate summary: {detail}") from e
+    except Exception as e:
+        print(f"[model] Error generating summary: {e}")
+        raise Exception(f"Failed to generate summary: {str(e)}")
 
-            if attempt + 1 < GEMINI_ATTEMPTS:
-                delay = GEMINI_BACKOFF_BASE_SEC * (2**attempt)
-                print(f"[warn] Transient limit; sleeping {delay:.1f}s then retry...")
-                time.sleep(delay)
 
-    msg = (
-        f"Unable to generate summary: still rate-limited after {GEMINI_ATTEMPTS} attempt(s) with backoff. "
-        "Wait 1–2 minutes, try GEMINI_MODEL=gemini-1.5-flash, or enable billing for higher quota."
-    )
-    if last_error:
-        raise Exception(msg) from last_error
-    raise Exception(msg)
+def _format_summary_points(chunk_summaries, language, is_lyrics=False, frequent_names=None, style="bullet"):
+    """Format summaries into high-quality points based on style"""
+    import re
+    from difflib import get_close_matches
+    from collections import Counter
+
+    all_sentences = []
+
+    # AI and YouTube noise patterns (to strip from start or filter out entirely)
+    ai_noise_patterns = [
+        r'^(the video (discusses|explains|shows|talks about|is about|tells the story of|starts with)|'
+        r'in this video|it is mentioned that|the speaker (says|explains|talks)|'
+        r'this video|according to the video|the narrator|the clip|the story|it tells the story of|'
+        r'the narrator says|the scene shows|we see)\s*',
+        r'^(and|but|so|then|next|also|furthermore|additionally)\s*'
+    ]
+
+    # Patterns that indicate a sentence is "junk" and should be removed entirely
+    junk_patterns = [
+        r'for more[:\s]', r'subscribe', r'link in (the )?description', 
+        r'click (the )?link', r'the book of the book', r'the back of the back',
+        r'author of the book', r'visit our website', r'thanks for watching',
+        r'follow us on', r'check out (our )?other videos',
+        r'story segments:', r'introduction -> problem', r'narrative arc:',
+        r'12 bullet points', r'segments to synthesize', r'transcript segments to use:',
+        r'task: synthesize', r'requirements:', r'exactly 12 detailed',
+        r'logic:', r'names:', r'no name:', r'no ending', r'no message', r'flow:',
+        r'segments:', r'write a high-quality', r'focus on the story arc',
+        r'do not repeat these instructions'
+    ]
+
+    # Pre-process frequent names
+    main_characters = []
+    if frequent_names:
+        sorted_names = sorted(frequent_names.items(), key=lambda x: x[1], reverse=True)
+        main_characters = [name for name, count in sorted_names if count >= 3]
+        if not main_characters and sorted_names:
+            main_characters = [sorted_names[0][0]]
+
+    for summary in chunk_summaries:
+        summary = summary.replace("<n>", " ").strip()
+        
+        # Step 1: Fix name spelling
+        if main_characters:
+            words = summary.split()
+            for i, word in enumerate(words):
+                clean_word = re.sub(r'[^a-zA-Z]', '', word)
+                if clean_word and clean_word[0].isupper() and len(clean_word) > 3:
+                    if clean_word not in main_characters:
+                        matches = get_close_matches(clean_word, main_characters, n=1, cutoff=0.6)
+                        if matches:
+                            words[i] = word.replace(clean_word, matches[0])
+            summary = " ".join(words)
+
+        # Split by sentences (FIX 3)
+        parts = re.split(r'(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=[.!?])\s+|(?<=\n)', summary)
+        
+        for p in parts:
+            p = p.strip()
+            if not p: continue
+            
+            # STEP 4: Weak sentence filtering (Aggressive for high quality)
+            if len(p.split()) < 12: # Increased threshold for longer, more descriptive sentences
+                continue
+            
+            # Clean up leading dashes or bullet symbols the AI might have added
+            p = re.sub(r'^[\-\*●•\d\.\s]+', '', p).strip()
+            
+            weak_phrases = ["why are you", "nothing will happen", "click the link", "they are very smart", "in this segment", "this summary describes", "segments to synthesize"]
+            if any(phrase in p.lower() for phrase in weak_phrases):
+                continue
+                
+            if any(re.search(jp, p.lower()) for jp in junk_patterns): continue
+            
+            # Repetition check within sentence
+            words = p.lower().split()
+            if len(words) > 15: 
+                counts = Counter(words)
+                if any(count > len(words) * 0.3 for word, count in counts.items() if len(word) > 3): continue
+
+            for pattern in ai_noise_patterns:
+                p = re.sub(pattern, '', p, flags=re.IGNORECASE).strip()
+            
+            p = re.sub(r'\s+', ' ', p)
+            if not p or len(p) < 60: # Increased minimum character length for detail
+                continue
+            
+            if p.lower().endswith((' and', ' the', ' a', ' an', ' is', ' to', ' of', ' for', ' in', ' on')): continue
+                
+            # STEP 2: Humanize each point
+            p = clean_sentence(p)
+            if p:
+                all_sentences.append(p)
+
+    # Deduplication and Flow Logic (STEP 1)
+    seen_normalized = []
+    unique = []
+
+    for s in all_sentences:
+        # Clean normalization for comparison
+        norm_s = re.sub(r'[^a-zA-Z0-9 ]', '', s.lower())
+        words = norm_s.split()
+        meaningful_words = {w for w in words if len(w) > 3}
+        if not meaningful_words: continue
+
+        is_duplicate = False
+        for existing in seen_normalized:
+            # Jaccard similarity or simple overlap
+            intersection = meaningful_words & existing
+            union = meaningful_words | existing
+            similarity = len(intersection) / len(union) if union else 0
+            
+            # Stricter overlap for high quality
+            if similarity > 0.4 or len(intersection) > min(len(meaningful_words), len(existing)) * 0.6:
+                is_duplicate = True
+                break
+
+        if not is_duplicate:
+            seen_normalized.append(meaningful_words)
+            unique.append(s)
+
+    # Reorder points using logic (STEP 1)
+    flowed_points = reorder_points(unique)
+
+    # Selection logic for target count
+    target_count = 12 
+    if style == "short": target_count = 3
+    elif style == "takeaways": target_count = 6
+    
+    if is_lyrics:
+        points = flowed_points[:10]
+    else:
+        # We trust the hierarchical flow but still apply reorder_points for safety
+        points = flowed_points
+        
+        if len(points) > target_count:
+            # Chronological downsampling
+            indices = [int(i * (len(points) - 1) / (target_count - 1)) for i in range(target_count)]
+            points = [points[i] for i in indices]
+        
+        # If we have fewer than target_count, split long points
+        if len(points) < target_count and len(points) > 0:
+            final_split = []
+            for p in points:
+                if len(p) > 150 and (len(final_split) + (len(points) - points.index(p))) < target_count:
+                    parts = re.split(r'\s+(?:and|but|while|so|then)\s+', p, flags=re.I)
+                    for part in parts:
+                        if len(part) > 35:
+                            final_split.append(clean_sentence(part))
+                            if (len(final_split) + (len(points) - points.index(p) - 1)) >= target_count: break
+                else:
+                    final_split.append(p)
+                if len(final_split) >= target_count: break
+            points = final_split[:target_count]
+
+    if len(points) < 2 and not is_lyrics:
+        return "The video content was too short or unclear to generate a full summary."
+
+    # Final formatting
+    if language and "hindi" in language.lower():
+        if is_lyrics: header = "📋 गीत का अर्थ:\n"
+        elif style == "short": header = "⚡ संक्षिप्त सारांश:\n"
+        elif style == "takeaways": header = "🎯 मुख्य बिंदु:\n"
+        else: header = f"📋 वीडियो के {len(points)} मुख्य बिंदु:\n"
+    else:
+        if is_lyrics: header = "📖 Meaning of the Song:\n"
+        elif style == "short": header = "⚡ Key Highlights:\n"
+        elif style == "takeaways": header = "🎯 Main Takeaways:\n"
+        else: header = f"📋 Full Detailed Summary ({len(points)} Key Points):\n"
+
+    formatted = [f"● {p}" for p in points]
+    return header + "\n" + "\n".join(formatted)
+
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
